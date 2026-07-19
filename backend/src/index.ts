@@ -31,59 +31,6 @@ app.use((req, _res, next) => {
 // Routes
 app.use('/api/game', gameRoutes);
 
-// TEMPORARY diagnostic route - checks full identity resolution (chainPubkey
-// included) for our own agent nametag, to debug the "no published identity"
-// error seen on real v2 sends. Remove once resolved.
-app.get('/api/debug/resolve-self', async (_req, res) => {
-  try {
-    const { sphereService } = await import('./services/index.js');
-    const peer = await sphereService.debugResolvePeer(config.agentNametag);
-    res.json({ success: true, peer });
-  } catch (error) {
-    res.json({ success: false, error: error instanceof Error ? error.message : String(error) });
-  }
-});
-
-app.get('/api/debug/local-identity', async (_req, res) => {
-  try {
-    const { sphereService } = await import('./services/index.js');
-    const identity = sphereService.debugLocalIdentity();
-    res.json({ success: true, identity });
-  } catch (error) {
-    res.json({ success: false, error: error instanceof Error ? error.message : String(error) });
-  }
-});
-
-app.get('/api/debug/republish', async (_req, res) => {
-  try {
-    const { sphereService } = await import('./services/index.js');
-    const peer = await sphereService.republishIdentity(config.agentNametag);
-    res.json({ success: true, peer });
-  } catch (error) {
-    res.json({ success: false, error: error instanceof Error ? error.message : String(error) });
-  }
-});
-
-app.get('/api/debug/delivery-state', async (_req, res) => {
-  try {
-    const { sphereService } = await import('./services/index.js');
-    const state = await sphereService.debugDeliveryState();
-    res.json({ success: true, state });
-  } catch (error) {
-    res.json({ success: false, error: error instanceof Error ? error.message : String(error) });
-  }
-});
-
-app.get('/api/debug/reprocess-mailbox', async (_req, res) => {
-  try {
-    const { sphereService } = await import('./services/index.js');
-    const result = await sphereService.debugReprocessMailbox();
-    res.json({ success: true, result });
-  } catch (error) {
-    res.json({ success: false, error: error instanceof Error ? error.message : String(error) });
-  }
-});
-
 // Health check (both paths for flexibility)
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
