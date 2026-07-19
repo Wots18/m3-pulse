@@ -12,6 +12,8 @@ export const config = {
   // Token
   tokenSymbol: import.meta.env.VITE_TOKEN_SYMBOL || 'UCT',
   tokenName: import.meta.env.VITE_TOKEN_NAME || 'UCT Token',
+  coinId: import.meta.env.VITE_COIN_ID || '',
+  agentNametag: import.meta.env.VITE_AGENT_NAMETAG || '',
 
   // Refetch intervals (in milliseconds)
   refetchCurrentRound: parseInt(import.meta.env.VITE_REFETCH_CURRENT_ROUND || '5000', 10),

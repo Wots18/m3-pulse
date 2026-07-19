@@ -1,32 +1,15 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
-import type { ChangeEvent } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { HelpCircle, History as HistoryIcon, Wallet, TrendingUp, TrendingDown, Check, X } from 'lucide-react';
+import { INTENT_ACTIONS } from '@unicitylabs/sphere-sdk/connect';
+import { parseTokenAmount } from '@unicitylabs/sphere-sdk';
 import { gameApi } from '../api/client';
 import type { BetItem } from '../api/client';
 import { useCurrentRound, usePreviousRound, useUserBetsInCurrentRound, usePlaceBets } from '../api/hooks';
+import { useWalletConnect } from '../hooks/useWalletConnect';
 import { config } from '../config';
 import './lottery.css';
-
-const NAMETAG_KEY = 'pricecall_nametag';
-
-function loadNametag(): string {
-  try {
-    return localStorage.getItem(NAMETAG_KEY) || '';
-  } catch {
-    return '';
-  }
-}
-
-function saveNametag(nametag: string): void {
-  try {
-    if (nametag) localStorage.setItem(NAMETAG_KEY, nametag);
-    else localStorage.removeItem(NAMETAG_KEY);
-  } catch {
-    // localStorage unavailable - not fatal
-  }
-}
 
 function formatTime(seconds: number): string {
   const m = Math.floor(seconds / 60);
@@ -80,9 +63,6 @@ function useLivePrice(asset: string | undefined): number | null {
 type Direction = 'up' | 'down';
 
 export function Home() {
-  const [userNametag, setUserNametag] = useState(loadNametag);
-  const [nametagStatus, setNametagStatus] = useState<'idle' | 'checking' | 'valid' | 'invalid'>('idle');
-  const [nametagError, setNametagError] = useState<string | null>(null);
   const [showConnectModal, setShowConnectModal] = useState(false);
   const [showHowToPlayModal, setShowHowToPlayModal] = useState(false);
   const [selectedDirection, setSelectedDirection] = useState<Direction | null>(null);
@@ -91,7 +71,6 @@ export function Home() {
   const [showPaymentModal, setShowPaymentModal] = useState(false);
   const [paymentStep, setPaymentStep] = useState<'confirm' | 'awaiting' | 'paid' | 'failed'>('confirm');
   const [pendingBetItems, setPendingBetItems] = useState<BetItem[]>([]);
-  const [pendingBetId, setPendingBetId] = useState<string | null>(null);
   const [paymentError, setPaymentError] = useState<string | null>(null);
   const [roundResult, setRoundResult] = useState<{ won: boolean; direction: Direction } | null>(null);
 
@@ -100,10 +79,23 @@ export function Home() {
   const lockedBetRef = useRef<{ direction: Direction; amount: number } | null>(null);
   const hasHandledRoundRef = useRef<number | null>(null);
 
+  const {
+    isConnected,
+    isConnecting,
+    isAutoConnecting,
+    isWalletLocked,
+    identity,
+    error: connectError,
+    connect,
+    disconnect,
+    intent,
+  } = useWalletConnect();
+  const userNametag = identity?.nametag;
+
   const { data: round } = useCurrentRound();
   const { data: previousRound } = usePreviousRound();
   const { data: myCurrentRoundBets } = useUserBetsInCurrentRound(
-    nametagStatus === 'valid' ? userNametag : undefined
+    isConnected ? userNametag : undefined
   );
   const placeBetMutation = usePlaceBets();
   const livePrice = useLivePrice(round?.asset);
@@ -159,53 +151,50 @@ export function Home() {
     prevRoundNumberRef.current = round.roundNumber;
   }, [round?.roundNumber, queryClient]);
 
-  // Poll for payment confirmation after placing a bet
-  useEffect(() => {
-    if (!pendingBetId || paymentStep !== 'awaiting') return;
-
+  // Confirm payment with the backend after the Connect intent succeeds.
+  // The intent() call itself is the "did the wallet actually send it" check;
+  // this just waits for the backend's own incoming-transfer listener to catch
+  // up and mark the bet paid, which is what actually updates the round pool.
+  const pollForConfirmation = (betId: string, nametag: string): void => {
     let pollCount = 0;
-    const maxPolls = 60; // 60 * 2s = 2 minute timeout
+    const maxPolls = 20; // 20 * 1.5s = 30s - should be fast since payment already sent
 
     const pollInterval = setInterval(async () => {
       pollCount++;
       try {
-        const response = await gameApi.getUserBetsInCurrentRound(userNametag);
-        let pendingBet = response.data.data.find((b) => b._id === pendingBetId);
+        const response = await gameApi.getUserBetsInCurrentRound(nametag);
+        let pendingBet = response.data.data.find((b) => b._id === betId);
 
         if (!pendingBet) {
-          const historyResponse = await gameApi.getUserBets(userNametag, 10);
-          pendingBet = historyResponse.data.data.find((b) => b._id === pendingBetId);
+          const historyResponse = await gameApi.getUserBets(nametag, 10);
+          pendingBet = historyResponse.data.data.find((b) => b._id === betId);
         }
 
-        if (pendingBet) {
-          if (pendingBet.paymentStatus === 'paid') {
-            clearInterval(pollInterval);
-            setPaymentStep('paid');
-            queryClient.invalidateQueries({ queryKey: ['userBetsInCurrentRound'] });
-            queryClient.invalidateQueries({ queryKey: ['currentRound'] });
-            setTimeout(() => {
-              setShowPaymentModal(false);
-              setPendingBetItems([]);
-              setPendingBetId(null);
-              setPaymentStep('confirm');
-              setSelectedDirection(null);
-              setBetAmount('');
-            }, 1500);
-          } else if (
-            pendingBet.paymentStatus === 'expired' ||
+        if (pendingBet?.paymentStatus === 'paid') {
+          clearInterval(pollInterval);
+          setPaymentStep('paid');
+          queryClient.invalidateQueries({ queryKey: ['userBetsInCurrentRound'] });
+          queryClient.invalidateQueries({ queryKey: ['currentRound'] });
+          setTimeout(() => {
+            setShowPaymentModal(false);
+            setPendingBetItems([]);
+            setPaymentStep('confirm');
+            setSelectedDirection(null);
+            setBetAmount('');
+          }, 1500);
+        } else if (
+          pendingBet &&
+          (pendingBet.paymentStatus === 'expired' ||
             pendingBet.paymentStatus === 'failed' ||
+            pendingBet.paymentStatus === 'refunded')
+        ) {
+          clearInterval(pollInterval);
+          setPaymentStep('failed');
+          setPaymentError(
             pendingBet.paymentStatus === 'refunded'
-          ) {
-            clearInterval(pollInterval);
-            setPaymentStep('failed');
-            setPaymentError(
-              pendingBet.paymentStatus === 'expired'
-                ? 'Payment expired. Please try again.'
-                : pendingBet.paymentStatus === 'refunded'
-                  ? 'Round closed. Payment refunded to your wallet.'
-                  : 'Payment failed. Please try again.'
-            );
-          }
+              ? 'Round closed. Payment refunded to your wallet.'
+              : 'Payment could not be confirmed. Please contact support if funds left your wallet.'
+          );
         }
       } catch {
         // Ignore transient polling errors, keep trying
@@ -214,37 +203,12 @@ export function Home() {
       if (pollCount >= maxPolls) {
         clearInterval(pollInterval);
         setPaymentStep('failed');
-        setPaymentError('Payment timeout. Check your wallet and try again.');
+        setPaymentError(
+          'Sent, but confirmation is taking longer than expected. Check "My Calls" shortly.'
+        );
       }
-    }, 2000);
-
-    return () => clearInterval(pollInterval);
-  }, [pendingBetId, paymentStep, userNametag, queryClient]);
-
-  // Validate nametag
-  const validateNametag = useCallback(async (nametag: string) => {
-    if (!nametag || nametag.length < 2) {
-      setNametagStatus('idle');
-      setNametagError(null);
-      return;
-    }
-    setNametagStatus('checking');
-    setNametagError(null);
-    try {
-      await gameApi.validateNametag(nametag);
-      setNametagStatus('valid');
-      setNametagError(null);
-    } catch (error: unknown) {
-      setNametagStatus('invalid');
-      const axiosError = error as { response?: { data?: { error?: string } } };
-      setNametagError(axiosError?.response?.data?.error || 'Nametag not found');
-    }
-  }, []);
-
-  useEffect(() => {
-    const timer = setTimeout(() => validateNametag(userNametag), 500);
-    return () => clearTimeout(timer);
-  }, [userNametag, validateNametag]);
+    }, 1500);
+  };
 
   // Round countdown timer
   useEffect(() => {
@@ -261,19 +225,13 @@ export function Home() {
     return () => clearInterval(interval);
   }, [round?.startTime, round?.roundDurationSeconds]);
 
-  const handleNametagChange = (e: ChangeEvent<HTMLInputElement>): void => {
-    const value = e.target.value.trim();
-    setUserNametag(value);
-    saveNametag(value);
-  };
-
   const handleSelectDirection = (direction: Direction): void => {
     if (round?.status !== 'open') return;
     setSelectedDirection(direction);
   };
 
   const handlePlaceCall = (): void => {
-    if (nametagStatus !== 'valid') {
+    if (!isConnected) {
       setShowConnectModal(true);
       return;
     }
@@ -285,31 +243,51 @@ export function Home() {
     setShowPaymentModal(true);
   };
 
-  const handleConfirmBet = (): void => {
-    if (pendingBetItems.length === 0) return;
+  // Maps Connect protocol error codes/messages to plain-language explanations
+  const describeConnectError = (err: unknown): string => {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/USER_REJECTED|rejected/i.test(message)) return 'You declined the payment in your wallet.';
+    if (/INSUFFICIENT_BALANCE/i.test(message)) return "Insufficient UCT balance in your wallet.";
+    if (/INTENT_CANCELLED|cancelled/i.test(message)) return 'Payment cancelled.';
+    if (/SESSION_EXPIRED/i.test(message)) return 'Wallet session expired. Please reconnect.';
+    if (/not.connected/i.test(message)) return 'Wallet disconnected. Please reconnect.';
+    return message || 'Payment failed. Please try again.';
+  };
+
+  const handleConfirmBet = async (): Promise<void> => {
+    if (pendingBetItems.length === 0 || !userNametag) return;
     setPaymentStep('awaiting');
     setPaymentError(null);
 
-    placeBetMutation.mutate(
-      { userNametag, bets: pendingBetItems },
-      {
-        onSuccess: (data) => {
-          setPendingBetId(data.bet._id);
-        },
-        onError: (error: unknown) => {
-          setPaymentStep('failed');
-          const axiosError = error as { response?: { data?: { error?: string } } };
-          setPaymentError(axiosError?.response?.data?.error || 'Failed to place your call. Please try again.');
-        },
-      }
-    );
+    try {
+      // 1. Register the bet with the backend - this reserves the round slot
+      //    and returns an invoiceId used as the payment memo for matching.
+      const { bet, invoice } = await placeBetMutation.mutateAsync({
+        userNametag,
+        bets: pendingBetItems,
+      });
+
+      // 2. Send payment directly from the connected wallet via Connect.
+      //    This is what actually opens the approval prompt in the user's wallet.
+      await intent(INTENT_ACTIONS.SEND, {
+        to: `@${config.agentNametag}`,
+        amount: parseTokenAmount(invoice.amount.toString()).toString(),
+        coinId: config.coinId,
+        memo: invoice.invoiceId,
+      });
+
+      // 3. Wait for the backend to confirm it saw the payment
+      pollForConfirmation(bet._id, userNametag);
+    } catch (error: unknown) {
+      setPaymentStep('failed');
+      setPaymentError(describeConnectError(error));
+    }
   };
 
   const closePaymentModal = (): void => {
     if (paymentStep === 'awaiting') return; // Don't allow closing mid-payment
     setShowPaymentModal(false);
     setPendingBetItems([]);
-    setPendingBetId(null);
     setPaymentStep('confirm');
     setPaymentError(null);
   };
@@ -359,15 +337,24 @@ export function Home() {
             <HistoryIcon size={18} />
           </Link>
           <button
-            onClick={() => setShowConnectModal(true)}
-            className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold transition-colors ${
-              nametagStatus === 'valid'
+            onClick={() => (isConnected ? setShowConnectModal(true) : connect())}
+            disabled={isAutoConnecting}
+            className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold transition-colors disabled:opacity-50 ${
+              isConnected
                 ? 'bg-[#00ff88]/10 border border-[#00ff88]/40 text-[#00ff88]'
                 : 'bg-white/5 border border-white/10 text-gray-400 hover:text-white'
             }`}
           >
             <Wallet size={16} />
-            {nametagStatus === 'valid' ? `@${userNametag}` : 'Connect'}
+            {isAutoConnecting
+              ? '...'
+              : isConnected
+                ? userNametag
+                  ? `@${userNametag}`
+                  : 'Connected'
+                : isConnecting
+                  ? 'Connecting...'
+                  : 'Connect Wallet'}
           </button>
         </div>
       </header>
@@ -523,7 +510,7 @@ export function Home() {
       </main>
 
       {/* Footer nav */}
-      {nametagStatus === 'valid' && (
+      {isConnected && userNametag && (
         <Link
           to={`/mybets/${userNametag}`}
           className="fixed bottom-4 right-4 px-4 py-3 rounded-full bg-[#00ff88] text-[#0a0a0f] font-orbitron font-bold text-sm shadow-lg z-40"
@@ -532,7 +519,7 @@ export function Home() {
         </Link>
       )}
 
-      {/* Connect nametag modal */}
+      {/* Connect wallet modal */}
       {showConnectModal && (
         <div className="fixed inset-0 bg-black/90 backdrop-blur-md flex items-center justify-center z-50 px-4">
           <div className="relative w-full max-w-sm bg-linear-to-br from-[#0a0a0f] via-[#12121a] to-[#0a0a0f] rounded-2xl border border-white/10 p-6">
@@ -543,34 +530,52 @@ export function Home() {
             >
               <X size={20} />
             </button>
-            <h2 className="text-lg font-bold font-orbitron text-[#00ff88] mb-1">Connect Nametag</h2>
-            <p className="text-xs text-gray-500 mb-4">Enter your Sphere nametag to place calls</p>
-            <input
-              type="text"
-              value={userNametag}
-              onChange={handleNametagChange}
-              placeholder="your-nametag"
-              className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 outline-none focus:border-[#00ff88]/50 mb-2"
-            />
-            {nametagStatus === 'checking' && (
-              <p className="text-xs text-gray-500">Checking...</p>
+
+            {isConnected ? (
+              <>
+                <h2 className="text-lg font-bold font-orbitron text-[#00ff88] mb-1">Wallet Connected</h2>
+                <div className="mt-4 mb-4 py-3 px-4 rounded-xl bg-white/5 border border-white/10">
+                  {userNametag ? (
+                    <p className="text-sm flex items-center gap-1 text-[#00ff88]">
+                      <Check size={14} /> @{userNametag}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-yellow-400">
+                      No nametag set on this wallet yet - set one in Sphere to place calls.
+                    </p>
+                  )}
+                  {isWalletLocked && (
+                    <p className="text-xs text-yellow-400 mt-2">Wallet is locked - unlock it to continue.</p>
+                  )}
+                </div>
+                <button
+                  onClick={async () => {
+                    await disconnect();
+                    setShowConnectModal(false);
+                  }}
+                  className="w-full py-3 rounded-xl font-orbitron font-bold text-gray-300 border border-white/10 hover:border-white/30"
+                >
+                  DISCONNECT
+                </button>
+              </>
+            ) : (
+              <>
+                <h2 className="text-lg font-bold font-orbitron text-[#00ff88] mb-1">Connect Wallet</h2>
+                <p className="text-xs text-gray-500 mb-4">
+                  Connects to your Sphere wallet - browser extension, or opens{' '}
+                  sphere.unicity.network in a popup to approve.
+                </p>
+                {connectError && <p className="text-xs text-[#ff6b6b] mb-3">{connectError}</p>}
+                <button
+                  onClick={connect}
+                  disabled={isConnecting}
+                  className="w-full py-3 rounded-xl font-orbitron font-bold text-[#0a0a0f] disabled:opacity-50"
+                  style={{ background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)' }}
+                >
+                  {isConnecting ? 'CONNECTING...' : 'CONNECT'}
+                </button>
+              </>
             )}
-            {nametagStatus === 'valid' && (
-              <p className="text-xs text-[#00ff88] flex items-center gap-1">
-                <Check size={14} /> Nametag verified
-              </p>
-            )}
-            {nametagStatus === 'invalid' && (
-              <p className="text-xs text-[#ff6b6b]">{nametagError}</p>
-            )}
-            <button
-              onClick={() => setShowConnectModal(false)}
-              disabled={nametagStatus !== 'valid'}
-              className="w-full mt-4 py-3 rounded-xl font-orbitron font-bold text-[#0a0a0f] disabled:opacity-30"
-              style={{ background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)' }}
-            >
-              DONE
-            </button>
           </div>
         </div>
       )}
@@ -676,7 +681,7 @@ export function Home() {
                   <h2 className="text-base font-bold text-[#00ff88] font-orbitron tracking-widest mb-2">
                     AWAITING PAYMENT
                   </h2>
-                  <p className="text-sm text-gray-400 mb-1">Check your wallet for the payment request</p>
+                  <p className="text-sm text-gray-400 mb-1">Approve the payment in your wallet</p>
                   <p className="text-xs text-gray-600">Waiting for confirmation...</p>
                   <div className="mt-4 pt-4 border-t border-white/5">
                     <span className="text-gray-500 text-sm">Amount: </span>

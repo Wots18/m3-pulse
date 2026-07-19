@@ -266,6 +266,38 @@ export class SphereService {
     console.log('[SphereService] Transfer did not match any pending payment');
   }
 
+  // TEMPORARY diagnostic - checks the full resolved peer info (chainPubkey
+  // included) for a nametag, not just the transport pubkey. Used to verify
+  // whether the chain pubkey is actually published correctly.
+  async debugResolvePeer(nametag: string): Promise<unknown> {
+    if (!this.sphere) {
+      throw new Error('Sphere not initialized');
+    }
+    const clean = nametag.replace('@', '').trim();
+    return this.sphere.resolve(`@${clean}`);
+  }
+
+  // TEMPORARY diagnostic - the LOCAL identity object, to compare against
+  // what got published on Nostr.
+  debugLocalIdentity(): unknown {
+    if (!this.sphere) {
+      throw new Error('Sphere not initialized');
+    }
+    return this.sphere.identity;
+  }
+
+  // TEMPORARY fix - re-publishes the identity binding now that the wallet-api
+  // layer is fully initialized, correcting a binding that was published with
+  // empty chainPubkey/directAddress earlier in this session.
+  async republishIdentity(nametag: string): Promise<unknown> {
+    if (!this.sphere) {
+      throw new Error('Sphere not initialized');
+    }
+    const clean = nametag.replace('@', '').trim();
+    await this.sphere.registerNametag(clean);
+    return this.sphere.resolve(`@${clean}`);
+  }
+
   async resolvePubkey(nametag: string): Promise<string | null> {
     if (!this.sphere) {
       throw new Error('Sphere not initialized');
