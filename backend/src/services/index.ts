@@ -16,6 +16,8 @@ const sphereConfig: SphereConfig = {
   coinId: config.coinId,
   paymentTimeoutSeconds: config.paymentTimeoutSeconds,
   debug: config.nodeEnv === 'development',
+  walletApiUrl: config.walletApiUrl,
+  walletApiDeviceId: config.walletApiDeviceId,
 };
 
 // Create service instances

@@ -19,6 +19,8 @@ export const config = {
   // Aggregator
   aggregatorUrl: process.env.AGGREGATOR_URL || 'https://goggregator-test.unicity.network',
   aggregatorApiKey: process.env.AGGREGATOR_API_KEY || '',
+  walletApiUrl: process.env.WALLET_API_URL || 'https://wallet-api.unicity.network',
+  walletApiDeviceId: process.env.WALLET_API_DEVICE_ID || '',
 
   // Payment
   coinId: process.env.COIN_ID || '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89',

@@ -112,26 +112,25 @@ export class GameService {
     // Calculate total amount
     const totalAmount = bets.reduce((sum, bet) => sum + bet.amount, 0);
 
-    // Create invoice via Nostr (pass bets and roundNumber for validation)
-    const invoice = await sphereService.createInvoice(
-      userNametag,
-      totalAmount,
-      bets,
-      round.roundNumber
-    );
-
-    // Create bet record
+    // Create the bet record first so we have a stable id to use as the
+    // invoice reference (this becomes the memo the frontend sends with its
+    // Connect payment, letting the backend match it unambiguously)
     const betRecord = new Bet({
       roundId: round._id,
       roundNumber: round.roundNumber,
       userNametag,
       bets,
       totalAmount,
-      invoiceId: invoice.invoiceId,
+      invoiceId: '',
       paymentStatus: 'pending',
     });
-
+    const invoiceId = (betRecord._id as mongoose.Types.ObjectId).toString();
+    betRecord.invoiceId = invoiceId;
     await betRecord.save();
+
+    // Register with SphereService so the incoming-transfer listener knows to
+    // watch for this exact payment (matched by memo === invoiceId)
+    const invoice = sphereService.registerPendingPayment(invoiceId, userNametag, totalAmount);
 
     return {
       bet: betRecord as IBet,

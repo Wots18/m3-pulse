@@ -1,6 +1,7 @@
-import { Sphere, toSmallestUnit, toHumanReadable } from '@unicitylabs/sphere-sdk';
+import { Sphere, parseTokenAmount, toHumanReadable } from '@unicitylabs/sphere-sdk';
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
-import type { PaymentRequestResult, TransferResult } from '@unicitylabs/sphere-sdk';
+import { createOwnStorageWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
+import type { TransferResult } from '@unicitylabs/sphere-sdk';
 import type { NetworkType } from '@unicitylabs/sphere-sdk';
 
 export interface SphereConfig {
@@ -14,6 +15,8 @@ export interface SphereConfig {
   coinId: string;
   paymentTimeoutSeconds: number;
   debug?: boolean;
+  walletApiUrl?: string;
+  walletApiDeviceId?: string;
 }
 
 export interface Invoice {
@@ -23,11 +26,6 @@ export interface Invoice {
   status: 'pending' | 'paid' | 'expired';
   createdAt: Date;
   expiresAt: Date;
-}
-
-export interface BetDetail {
-  direction: 'up' | 'down';
-  amount: number;
 }
 
 export interface TokenTransfer {
@@ -51,7 +49,6 @@ export interface PaymentInfo {
 export type PaymentConfirmedCallback = (paymentInfo: PaymentInfo) => void;
 
 interface PendingPayment {
-  requestId: string;
   invoiceId: string;
   userNametag: string;
   amount: number;
@@ -66,7 +63,6 @@ export class SphereService {
   private connected = false;
   private onPaymentConfirmed: PaymentConfirmedCallback | null = null;
   private pendingPayments: Map<string, PendingPayment> = new Map();
-  private paymentRequestUnsubscribe: (() => void) | null = null;
 
   constructor(config: SphereConfig) {
     this.config = config;
@@ -82,8 +78,18 @@ export class SphereService {
       await this.doInitialize();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      // Known bug in @unicitylabs/sphere-sdk: Sphere.load() tries to auto-repair
+      // a missing nametag token by calling mintNametag() before marking the
+      // instance as initialized, which always throws "Sphere not initialized".
+      // Self-heal by clearing the local wallet cache and forcing a fresh
+      // Sphere.create() (which does not have this ordering bug) using the
+      // same AGENT_MNEMONIC, so the identity is preserved.
       if (message.includes('Sphere not initialized')) {
-        console.warn('[SphereService] Detected known SDK restore bug, self-healing...');
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[SphereService] Detected known SDK restore bug (Sphere.load() nametag repair). ' +
+            'Clearing local wallet cache and re-initializing from AGENT_MNEMONIC...'
+        );
         const fs = await import('fs/promises');
         await fs.rm(this.config.dataDir, { recursive: true, force: true }).catch(() => {});
         await this.doInitialize();
@@ -99,8 +105,8 @@ export class SphereService {
     // eslint-disable-next-line no-console
     console.log(`[SphereService] Initializing with network: ${network}...`);
 
-    // Create all providers using simplified factory
-    const providers = createNodeProviders({
+    // Create base providers using simplified factory
+    const baseProviders = createNodeProviders({
       network,
       dataDir: this.config.dataDir,
       tokensDir: this.config.tokensDir || './sphere-tokens',
@@ -115,12 +121,25 @@ export class SphereService {
       // L1 not needed for UCT token lottery - omit to disable
     });
 
+    // Compose the wallet-api delivery rail on top. Without this, payments sent
+    // by a Connect-connected wallet (e.g. the hosted sphere.unicity.network
+    // wallet) would never be seen by this agent - bare createNodeProviders
+    // only listens on the Nostr transport, and Connect-originated sends are
+    // delivered via the wallet-api mailbox instead. Own-storage preset keeps
+    // our existing local wallet.json custody model unchanged; wallet-api is
+    // purely an additional delivery/notification rail on top of it.
+    const providers = createOwnStorageWalletApiProviders(baseProviders, {
+      baseUrl: this.config.walletApiUrl || 'https://wallet-api.unicity.network',
+      network: 'testnet2',
+      deviceId: this.config.walletApiDeviceId || `m3pricecall-agent-${this.config.nametag}`,
+    });
+
     // Initialize Sphere SDK
     // If mnemonic is provided in config, use it; otherwise auto-generate
     // Pass nametag to init so it's registered during wallet creation
     const initOptions = this.config.mnemonic
-      ? { ...providers, mnemonic: this.config.mnemonic, nametag: this.config.nametag }
-      : { ...providers, autoGenerate: true, nametag: this.config.nametag };
+      ? { ...providers, mnemonic: this.config.mnemonic, nametag: this.config.nametag, network }
+      : { ...providers, autoGenerate: true, nametag: this.config.nametag, network };
 
     const { sphere, created, generatedMnemonic } = await Sphere.init(initOptions);
 
@@ -160,14 +179,11 @@ export class SphereService {
       );
     }
 
-    // Subscribe to incoming transfers
+    // Subscribe to incoming transfers - this is now the only confirmation path.
+    // Connect-connected wallets send payment directly via intent('send', ...),
+    // matched here by memo (invoiceId), not via a sendPaymentRequest round-trip.
     sphere.on('transfer:incoming', (transfer) => {
       this.handleIncomingTransfer(transfer);
-    });
-
-    // Subscribe to payment request responses
-    this.paymentRequestUnsubscribe = sphere.payments.onPaymentRequestResponse((response) => {
-      this.handlePaymentRequestResponse(response);
     });
 
     // eslint-disable-next-line no-console
@@ -175,154 +191,79 @@ export class SphereService {
     // eslint-disable-next-line no-console
     console.log(`[SphereService] Nametag: @${sphere.getNametag() || this.config.nametag}`);
     // eslint-disable-next-line no-console
-    console.log(`[SphereService] Address: ${sphere.identity?.address?.slice(0, 20)}...`);
+    console.log(`[SphereService] Address: ${sphere.identity?.directAddress?.slice(0, 20)}...`);
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private handleIncomingTransfer(transfer: any): void {
     // eslint-disable-next-line no-console
-    console.log(`[SphereService] Incoming transfer: ${transfer.id}`);
+    console.log(`[SphereService] Incoming transfer: ${transfer.id}, memo: ${transfer.memo ?? '(none)'}`);
     // eslint-disable-next-line no-console
     console.log(`[SphereService] Pending payments count:`, this.pendingPayments.size);
 
-    // Try to match with pending payment
-    // eslint-disable-next-line no-console
-    console.log(
-      `[SphereService] Pending payment requestIds:`,
-      Array.from(this.pendingPayments.keys())
-    );
-    for (const [requestId, pending] of this.pendingPayments) {
+    const tokens = transfer.tokens || [];
+    let totalAmount = 0n;
+    const receivedAmounts: number[] = [];
+
+    for (const token of tokens) {
+      // Amount may be in format "coinId,amount" or just "amount"
+      let amountStr = token.amount || '0';
+      if (typeof amountStr === 'string' && amountStr.includes(',')) {
+        amountStr = amountStr.split(',')[1] || '0';
+      }
+      const amount = BigInt(amountStr);
+      totalAmount += amount;
+      receivedAmounts.push(parseFloat(toHumanReadable(amount.toString())));
+    }
+
+    const confirmMatch = (invoiceId: string, pending: PendingPayment): void => {
+      pending.confirmed = true;
+      // eslint-disable-next-line no-console
+      console.log(`[SphereService] Payment confirmed for invoice ${invoiceId} (tx ${transfer.id})`);
+      if (this.onPaymentConfirmed) {
+        this.onPaymentConfirmed({
+          invoiceId,
+          txId: transfer.id,
+          tokenCount: tokens.length,
+          totalAmount: pending.amount,
+          receivedAmounts,
+        });
+      }
+      this.pendingPayments.delete(invoiceId);
+    };
+
+    // Primary match: exact memo === invoiceId. This is the reliable path for
+    // Connect-initiated sends, which carry the invoiceId as the memo.
+    if (transfer.memo) {
+      const pending = this.pendingPayments.get(transfer.memo);
+      if (pending && !pending.confirmed && Date.now() <= pending.expiresAt) {
+        confirmMatch(transfer.memo, pending);
+        return;
+      }
+    }
+
+    // Fallback: match by amount, for any transfer that arrived without a
+    // recognizable memo. Ambiguous if two pending bets share an amount, so
+    // memo match is always preferred when available.
+    for (const [invoiceId, pending] of this.pendingPayments) {
       if (pending.confirmed) continue;
 
-      // Check if expired
       if (Date.now() > pending.expiresAt) {
-        this.pendingPayments.delete(requestId);
+        this.pendingPayments.delete(invoiceId);
         continue;
       }
 
-      // Match by checking if the transfer amount matches
-      const tokens = transfer.tokens || [];
-      let totalAmount = 0n;
-      const receivedAmounts: number[] = [];
-
-      for (const token of tokens) {
-        // Amount may be in format "coinId,amount" or just "amount"
-        let amountStr = token.amount || '0';
-        if (typeof amountStr === 'string' && amountStr.includes(',')) {
-          // eslint-disable-next-line no-console
-          console.log(`[SphereService] Parsing amount from coinId,amount format: ${amountStr}`);
-          amountStr = amountStr.split(',')[1] || '0';
-        }
-        const amount = BigInt(amountStr);
-        // eslint-disable-next-line no-console
-        console.log(
-          `[SphereService] Token amount: ${amount.toString()} (${toHumanReadable(amount.toString())} UCT)`
-        );
-        totalAmount += amount;
-        receivedAmounts.push(parseFloat(toHumanReadable(amount.toString())));
-      }
-
-      const expectedAmount = toSmallestUnit(pending.amount.toString());
-      // eslint-disable-next-line no-console
-      console.log(
-        `[SphereService] Matching: received=${totalAmount.toString()} vs expected=${expectedAmount} (pending.amount=${pending.amount} UCT)`
-      );
+      const expectedAmount = parseTokenAmount(pending.amount.toString());
       const tolerance = BigInt(1e14); // 0.0001 UCT tolerance
 
       if (totalAmount >= BigInt(expectedAmount) - tolerance) {
-        pending.confirmed = true;
-
-        // eslint-disable-next-line no-console
-        console.log(`[SphereService] Payment confirmed for invoice ${pending.invoiceId}`);
-
-        if (this.onPaymentConfirmed) {
-          this.onPaymentConfirmed({
-            invoiceId: pending.invoiceId,
-            txId: transfer.id,
-            tokenCount: tokens.length,
-            totalAmount: pending.amount,
-            receivedAmounts,
-          });
-        }
-
-        this.pendingPayments.delete(requestId);
+        confirmMatch(invoiceId, pending);
         return;
       }
     }
 
     // eslint-disable-next-line no-console
     console.log('[SphereService] Transfer did not match any pending payment');
-  }
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private handlePaymentRequestResponse(response: any): void {
-    // eslint-disable-next-line no-console
-    console.log(
-      `[SphereService] Payment request response received:`,
-      JSON.stringify(response, null, 2)
-    );
-
-    // eslint-disable-next-line no-console
-    console.log(`[SphereService] Pending payments keys:`, Array.from(this.pendingPayments.keys()));
-
-    // Try to find pending payment by requestId or by iterating
-    let pending = this.pendingPayments.get(response.requestId);
-    let matchedKey = response.requestId;
-
-    // If not found by requestId, try to match by other fields
-    if (!pending) {
-      for (const [key, p] of this.pendingPayments) {
-        // eslint-disable-next-line no-console
-        console.log(
-          `[SphereService] Checking pending: key=${key}, invoiceId=${p.invoiceId}, requestId=${p.requestId}`
-        );
-        // Match by invoiceId or if there's only one pending payment
-        if (p.requestId === response.requestId || p.invoiceId === response.requestId) {
-          pending = p;
-          matchedKey = key;
-          break;
-        }
-      }
-    }
-
-    if (!pending) {
-      // eslint-disable-next-line no-console
-      console.log(
-        '[SphereService] No pending payment found for response.requestId:',
-        response.requestId
-      );
-      return;
-    }
-
-    // eslint-disable-next-line no-console
-    console.log(
-      `[SphereService] Found pending payment: invoiceId=${pending.invoiceId}, matchedKey=${matchedKey}`
-    );
-
-    if (response.responseType === 'paid' && response.transferId) {
-      pending.confirmed = true;
-      // eslint-disable-next-line no-console
-      console.log(`[SphereService] Payment PAID! transferId=${response.transferId}`);
-
-      if (this.onPaymentConfirmed) {
-        this.onPaymentConfirmed({
-          invoiceId: pending.invoiceId,
-          txId: response.transferId,
-          tokenCount: 1,
-          totalAmount: pending.amount,
-          receivedAmounts: [pending.amount],
-        });
-      }
-
-      this.pendingPayments.delete(matchedKey);
-    } else if (response.responseType === 'rejected') {
-      // eslint-disable-next-line no-console
-      console.log(`[SphereService] Payment request rejected: ${pending.invoiceId}`);
-      this.pendingPayments.delete(matchedKey);
-    } else {
-      // eslint-disable-next-line no-console
-      console.log(`[SphereService] Unhandled response type: ${response.responseType}`);
-    }
   }
 
   async resolvePubkey(nametag: string): Promise<string | null> {
@@ -381,71 +322,26 @@ export class SphereService {
     };
   }
 
-  async createInvoice(
-    userNametag: string,
-    amount: number,
-    bets: BetDetail[],
-    roundNumber: number
-  ): Promise<Invoice> {
+  // Registers an invoiceId to watch for. Used with the Connect payment flow:
+  // the frontend sends payment directly via client.intent('send', { memo: invoiceId }),
+  // and this just tells handleIncomingTransfer what to match it against - no
+  // outbound payment request is sent by the agent.
+  registerPendingPayment(invoiceId: string, userNametag: string, amount: number): Invoice {
     if (!this.sphere) {
       throw new Error('Sphere not initialized');
     }
 
     let recipientNametag = this.sphere.getNametag() || this.config.nametag;
-    // Remove @ prefix if present - payment request should send nametag without @
     if (recipientNametag.startsWith('@')) {
       recipientNametag = recipientNametag.slice(1);
     }
 
     // eslint-disable-next-line no-console
     console.log(
-      `[SphereService] Creating invoice for @${userNametag}, amount: ${amount}, round #${roundNumber}`
-    );
-    // eslint-disable-next-line no-console
-    console.log(`[SphereService] recipientNametag for payment request: "${recipientNametag}"`);
-
-    // Resolve user's pubkey
-    const userPubkey = await this.resolvePubkey(userNametag);
-    if (!userPubkey) {
-      throw new Error(
-        `Nametag @${userNametag} not found. Make sure it exists and has Nostr binding published.`
-      );
-    }
-
-    // Format bet details for message
-    const betsStr = bets.map((b) => `${b.direction}:${b.amount}`).join(', ');
-    const amountWithDecimals = toSmallestUnit(amount.toString()).toString();
-
-    // Send payment request via SDK
-    const result: PaymentRequestResult = await this.sphere.payments.sendPaymentRequest(
-      `@${userNametag}`,
-      {
-        amount: amountWithDecimals,
-        coinId: this.config.coinId,
-        recipientNametag,
-        message: `M3 PriceCall Round #${roundNumber} - Calls: ${betsStr}`,
-      }
+      `[SphereService] Registering pending payment for @${userNametag}, invoice ${invoiceId}, amount: ${amount}`
     );
 
-    if (!result.success || !result.requestId) {
-      throw new Error(result.error || 'Failed to send payment request');
-    }
-
-    const invoiceId = result.eventId || result.requestId;
-    const requestId = result.requestId!;
-
-    // eslint-disable-next-line no-console
-    console.log(`[SphereService] Payment request sent:`);
-    // eslint-disable-next-line no-console
-    console.log(`[SphereService]   eventId: ${result.eventId}`);
-    // eslint-disable-next-line no-console
-    console.log(`[SphereService]   requestId: ${requestId}`);
-    // eslint-disable-next-line no-console
-    console.log(`[SphereService]   invoiceId: ${invoiceId}`);
-
-    // Track pending payment
     const pending: PendingPayment = {
-      requestId,
       invoiceId,
       userNametag,
       amount,
@@ -454,21 +350,18 @@ export class SphereService {
       confirmed: false,
     };
 
-    this.pendingPayments.set(requestId, pending);
+    this.pendingPayments.set(invoiceId, pending);
     // eslint-disable-next-line no-console
     console.log(
-      `[SphereService] Added pending payment: requestId=${requestId}, amount=${amount} UCT, expires in ${this.config.paymentTimeoutSeconds}s`
+      `[SphereService] Watching invoice ${invoiceId}: ${amount} UCT, expires in ${this.config.paymentTimeoutSeconds}s`
     );
-    // eslint-disable-next-line no-console
-    console.log(`[SphereService] Total pending payments: ${this.pendingPayments.size}`);
 
-    // Set up timeout cleanup
     setTimeout(() => {
-      const p = this.pendingPayments.get(requestId);
+      const p = this.pendingPayments.get(invoiceId);
       if (p && !p.confirmed) {
-        this.pendingPayments.delete(requestId);
+        this.pendingPayments.delete(invoiceId);
         // eslint-disable-next-line no-console
-        console.log(`[SphereService] Payment request expired: ${invoiceId}`);
+        console.log(`[SphereService] Pending payment expired: ${invoiceId}`);
       }
     }, this.config.paymentTimeoutSeconds * 1000);
 
@@ -490,7 +383,7 @@ export class SphereService {
     // eslint-disable-next-line no-console
     console.log(`[SphereService] Sending ${amount} UCT to @${toNametag}...`);
 
-    const amountWithDecimals = toSmallestUnit(amount.toString()).toString();
+    const amountWithDecimals = parseTokenAmount(amount.toString()).toString();
 
     try {
       const result: TransferResult = await this.sphere.payments.send({
@@ -526,15 +419,10 @@ export class SphereService {
     if (!this.sphere?.identity) {
       throw new Error('Sphere not initialized');
     }
-    return this.sphere.identity.publicKey;
+    return this.sphere.identity.chainPubkey;
   }
 
   disconnect(): void {
-    if (this.paymentRequestUnsubscribe) {
-      this.paymentRequestUnsubscribe();
-      this.paymentRequestUnsubscribe = null;
-    }
-
     if (this.sphere) {
       this.sphere.destroy();
       this.sphere = null;
