@@ -64,6 +64,26 @@ app.get('/api/debug/republish', async (_req, res) => {
   }
 });
 
+app.get('/api/debug/delivery-state', async (_req, res) => {
+  try {
+    const { sphereService } = await import('./services/index.js');
+    const state = await sphereService.debugDeliveryState();
+    res.json({ success: true, state });
+  } catch (error) {
+    res.json({ success: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get('/api/debug/reprocess-mailbox', async (_req, res) => {
+  try {
+    const { sphereService } = await import('./services/index.js');
+    const result = await sphereService.debugReprocessMailbox();
+    res.json({ success: true, result });
+  } catch (error) {
+    res.json({ success: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 // Health check (both paths for flexibility)
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });

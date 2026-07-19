@@ -115,7 +115,11 @@ export class SphereService {
       },
       oracle: {
         apiKey: this.config.aggregatorApiKey,
-        trustBasePath: this.config.trustBasePath,
+        // trustBasePath intentionally NOT passed: the local trustbase-testnet.json
+        // is stale (networkId 3). Omitting it makes the SDK use its embedded,
+        // current testnet2 trust base (networkId 4). A mismatched trust base
+        // makes the engine reject every incoming token with
+        // "Token network mismatch: token is on network 4, engine on 3".
         debug: this.config.debug ?? false,
       },
       // L1 not needed for UCT token lottery - omit to disable
@@ -184,6 +188,14 @@ export class SphereService {
     // matched here by memo (invoiceId), not via a sendPaymentRequest round-trip.
     sphere.on('transfer:incoming', (transfer) => {
       this.handleIncomingTransfer(transfer);
+    });
+
+    // TEMPORARY diagnostic - log rejected incoming transfers with their reason,
+    // so silent rejections become visible in backend.log.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sphere as any).on('transfer:invalid', (info: any) => {
+      // eslint-disable-next-line no-console
+      console.warn('[SphereService] TRANSFER REJECTED:', JSON.stringify(info));
     });
 
     // eslint-disable-next-line no-console
@@ -296,6 +308,110 @@ export class SphereService {
     const clean = nametag.replace('@', '').trim();
     await this.sphere.registerNametag(clean);
     return this.sphere.resolve(`@${clean}`);
+  }
+
+  // TEMPORARY diagnostic - inspects the wallet-api delivery rail wiring and
+  // raw mailbox state, and force-runs the incoming pump so any silent failure
+  // surfaces as an HTTP-visible error. Remove before final submission.
+  async debugDeliveryState(): Promise<unknown> {
+    if (!this.sphere) {
+      throw new Error('Sphere not initialized');
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const payments = this.sphere.payments as any;
+    const delivery = payments?.injectedDelivery ?? null;
+    const state: Record<string, unknown> = {
+      hasInjectedDelivery: !!delivery,
+      deliveryCustody: delivery?.custody ?? null,
+      hasWakeSubscription: !!payments?.deliveryWakeUnsub,
+      hasPollTimer: !!payments?.deliveryPollTimer,
+    };
+    // Raw mailbox listing (includes claimed entries) BEFORE running the pump,
+    // so we see the untouched server-side state.
+    try {
+      const client = delivery?.client;
+      if (client?.listMailbox) {
+        const page = await client.listMailbox(0n);
+        state.mailboxEntryCount = page.entries.length;
+        state.mailboxMore = page.more;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        state.mailboxEntries = page.entries.slice(0, 10).map((e: any) => ({
+          entryId: String(e.entryId).slice(0, 16),
+          status: e.status,
+          transferId: e.transferId,
+          seq: String(e.seq),
+        }));
+      } else {
+        state.mailboxList = 'listMailbox unavailable on delivery client';
+      }
+    } catch (err) {
+      state.mailboxListError = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    }
+    // Force-run the pump - converts any silent failure into a visible error.
+    try {
+      const stored = await payments.pumpIncomingDeliveries();
+      state.pumpRan = true;
+      state.pumpStoredCount = stored;
+    } catch (err) {
+      state.pumpRan = false;
+      state.pumpError = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    }
+    return state;
+  }
+
+  // TEMPORARY diagnostic - re-fetches every mailbox entry's token blob and
+  // re-runs the SDK's own V2 transfer handler on it, returning the verdict.
+  // If the original rejection was transient, this RECOVERS the tokens.
+  // Remove before final submission.
+  async debugReprocessMailbox(): Promise<unknown> {
+    if (!this.sphere) {
+      throw new Error('Sphere not initialized');
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const payments = this.sphere.payments as any;
+    const delivery = payments?.injectedDelivery;
+    if (!delivery?.client?.listMailbox) {
+      throw new Error('delivery client unavailable');
+    }
+    const page = await delivery.client.listMailbox(0n);
+    const results: unknown[] = [];
+    for (const entry of page.entries) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const r: Record<string, any> = {
+        entryId: String(entry.entryId).slice(0, 16),
+        status: entry.status,
+        transferId: entry.transferId,
+      };
+      try {
+        if (entry.blobCollected || !entry.getUrl) {
+          r.blob = 'not fetchable (already collected by server)';
+          results.push(r);
+          continue;
+        }
+        const bytes: Uint8Array = await delivery.client.fetchBlob(entry.getUrl);
+        r.blobBytes = bytes.length;
+        const envelope = delivery.decryptDeliveryEnvelope
+          ? delivery.decryptDeliveryEnvelope(entry)
+          : {};
+        const verdict = await payments.handleV2Transfer(
+          {
+            type: 'V2_TRANSFER',
+            version: '2.0',
+            tokenBlob: Buffer.from(bytes).toString('hex'),
+            memo: envelope.memo,
+            ...(envelope.senderNametag !== undefined
+              ? { senderNametag: envelope.senderNametag }
+              : {}),
+          },
+          entry.senderPubkey ?? ''
+        );
+        r.verdict = verdict;
+      } catch (err) {
+        r.error = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      }
+      results.push(r);
+    }
+    return { entryCount: page.entries.length, results };
   }
 
   async resolvePubkey(nametag: string): Promise<string | null> {
