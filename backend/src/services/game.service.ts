@@ -1,4 +1,3 @@
-import crypto from 'crypto';
 import mongoose from 'mongoose';
 import {
   Round,
@@ -11,6 +10,7 @@ import {
 } from '../models/game.model.js';
 import { sphereService } from './index.js';
 import { config } from '../env.js';
+import { PriceService } from './price.service.js';
 
 export class GameService {
   // Log payment to database
@@ -43,19 +43,19 @@ export class GameService {
       console.error('[GameService] Failed to log payment:', error);
     }
   }
-  // Generate cryptographically secure random digit
-  static generateWinningDigit(): number {
-    return crypto.randomInt(0, 10);
-  }
-
-  // Create new round (handles race condition with duplicate key)
+  // Create new round - captures the live starting price so the round is resolvable
+  // against a real, publicly verifiable market feed (not a random draw)
   static async createRound(): Promise<IRound> {
     const lastRound = await Round.findOne().sort({ roundNumber: -1 });
     const roundNumber = lastRound ? lastRound.roundNumber + 1 : 1;
+    const asset = config.priceAsset;
+    const startPrice = await PriceService.getPrice(asset);
 
     try {
       const round = new Round({
         roundNumber,
+        asset,
+        startPrice,
         status: 'open',
         startTime: new Date(),
       });
@@ -95,8 +95,8 @@ export class GameService {
     }
 
     for (const bet of bets) {
-      if (bet.digit < 0 || bet.digit > 9) {
-        throw new Error('Digit must be between 0 and 9');
+      if (bet.direction !== 'up' && bet.direction !== 'down') {
+        throw new Error('Direction must be "up" or "down"');
       }
       if (bet.amount <= 0) {
         throw new Error('Amount must be positive');
@@ -306,7 +306,6 @@ export class GameService {
       console.error(`[GameService] Refund failed:`, error);
     }
   }
-
   // Close round - stop accepting bets
   static async closeRound(roundId: string): Promise<IRound> {
     // Use atomic update to prevent race conditions
@@ -323,9 +322,26 @@ export class GameService {
     return round as IRound;
   }
 
-  // Draw winning number
+  // Resolve the round against the live price feed - this is the core difference
+  // from the reference lottery: the outcome is a real, publicly checkable market
+  // move rather than a locally-generated random number.
   static async drawWinner(roundId: string): Promise<IRound> {
-    const winningDigit = this.generateWinningDigit();
+    const existingRound = await Round.findById(roundId);
+    if (!existingRound) {
+      throw new Error('Round not found');
+    }
+
+    const endPrice = await PriceService.getPrice(existingRound.asset);
+    const startPrice = existingRound.startPrice ?? endPrice;
+
+    let winningDirection: 'up' | 'down' | 'flat';
+    if (endPrice > startPrice) {
+      winningDirection = 'up';
+    } else if (endPrice < startPrice) {
+      winningDirection = 'down';
+    } else {
+      winningDirection = 'flat';
+    }
 
     // Use atomic update to prevent race conditions
     const round = await Round.findOneAndUpdate(
@@ -333,7 +349,8 @@ export class GameService {
       {
         $set: {
           status: 'drawing',
-          winningDigit,
+          endPrice,
+          winningDirection,
           drawTime: new Date(),
         },
       },
@@ -366,11 +383,11 @@ export class GameService {
       return;
     }
 
-    // Calculate total bets on the winning digit
+    // Calculate total bets on the winning direction
     let totalWinningBets = 0;
     for (const bet of bets) {
       for (const betItem of bet.bets) {
-        if (betItem.digit === round.winningDigit) {
+        if (betItem.direction === round.winningDirection) {
           totalWinningBets += betItem.amount;
         }
       }
@@ -378,7 +395,7 @@ export class GameService {
 
     // eslint-disable-next-line no-console
     console.log(
-      `[GameService] Pool: ${round.totalPool} UCT, Winning digit: ${round.winningDigit}, Bets on winner: ${totalWinningBets} UCT`
+      `[GameService] Pool: ${round.totalPool} UCT, Winning direction: ${round.winningDirection}, Bets on winner: ${totalWinningBets} UCT`
     );
 
     if (totalWinningBets === 0) {
@@ -414,7 +431,7 @@ export class GameService {
       let userWinningBet = 0;
 
       for (const betItem of bet.bets) {
-        if (betItem.digit === round.winningDigit) {
+        if (betItem.direction === round.winningDirection) {
           userWinningBet += betItem.amount;
         }
       }
@@ -431,7 +448,7 @@ export class GameService {
 
         // eslint-disable-next-line no-console
         console.log(
-          `[GameService] @${bet.userNametag} bet ${userWinningBet} on ${round.winningDigit}, wins ${winnings} UCT`
+          `[GameService] @${bet.userNametag} bet ${userWinningBet} on ${round.winningDirection}, wins ${winnings} UCT`
         );
       }
     }
@@ -486,7 +503,7 @@ export class GameService {
         await bet.save();
 
         // Find the winning bet details
-        const winningBetItem = bet.bets.find((b) => b.digit === round.winningDigit);
+        const winningBetItem = bet.bets.find((b) => b.direction === round.winningDirection);
 
         // Log outgoing payout
         await this.logPayment({
@@ -500,8 +517,8 @@ export class GameService {
           purpose: 'payout',
           metadata: {
             roundNumber: bet.roundNumber,
-            winningDigit: round.winningDigit,
-            betOnWinningDigit: winningBetItem?.amount || 0,
+            winningDirection: round.winningDirection,
+            betOnWinningDirection: winningBetItem?.amount || 0,
             totalBetAmount: bet.totalAmount,
             userBets: bet.bets,
             transactionCount: transfer.transactionCount,
@@ -542,7 +559,7 @@ export class GameService {
     return { processed, failed };
   }
 
-  // Get previous completed round (with winning digit)
+  // Get previous completed round (with winning direction)
   static async getPreviousRound(): Promise<IRound | null> {
     return Round.findOne({ status: 'completed' }).sort({ roundNumber: -1 });
   }

@@ -1,16 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { ChangeEvent } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { HelpCircle, BarChart2, Dices, Target, Lightbulb, Check, X } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { HelpCircle, History as HistoryIcon, Wallet, TrendingUp, TrendingDown, Check, X } from 'lucide-react';
 import { gameApi } from '../api/client';
-import type { BetItem, Round } from '../api/client';
-import { useCurrentRound, usePreviousRound, useRoundHistory, usePlaceBets, useUserBetsInCurrentRound, useUserBets } from '../api/hooks';
+import type { BetItem } from '../api/client';
+import { useCurrentRound, usePreviousRound, useUserBetsInCurrentRound, usePlaceBets } from '../api/hooks';
 import { config } from '../config';
 import './lottery.css';
 
-type BetsState = Record<number, string>;
-
-const NAMETAG_KEY = 'lottery_nametag';
+const NAMETAG_KEY = 'pricecall_nametag';
 
 function loadNametag(): string {
   try {
@@ -21,17 +20,13 @@ function loadNametag(): string {
 }
 
 function saveNametag(nametag: string): void {
-  if (nametag) {
-    localStorage.setItem(NAMETAG_KEY, nametag);
-  } else {
-    localStorage.removeItem(NAMETAG_KEY);
+  try {
+    if (nametag) localStorage.setItem(NAMETAG_KEY, nametag);
+    else localStorage.removeItem(NAMETAG_KEY);
+  } catch {
+    // localStorage unavailable - not fatal
   }
 }
-
-const DIGIT_COLORS = [
-  '#ff6b6b', '#ffd700', '#00ff88', '#4ecdc4', '#a855f7',
-  '#f472b6', '#fb923c', '#60a5fa', '#c084fc', '#34d399'
-] as const;
 
 function formatTime(seconds: number): string {
   const m = Math.floor(seconds / 60);
@@ -39,266 +34,192 @@ function formatTime(seconds: number): string {
   return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
 }
 
+// Client-side live price ticker - purely cosmetic. The round's actual outcome
+// always comes from the backend's own authoritative price fetch at close time.
+const COINGECKO_IDS: Record<string, string> = {
+  BTC: 'bitcoin', ETH: 'ethereum', SOL: 'solana', XRP: 'ripple', BNB: 'binancecoin',
+  OKB: 'okb', ADA: 'cardano', DOGE: 'dogecoin', TRX: 'tron', TON: 'the-open-network',
+  DOT: 'polkadot', MATIC: 'polygon-ecosystem-token', LINK: 'chainlink', AVAX: 'avalanche-2',
+  SHIB: 'shiba-inu', LTC: 'litecoin', BCH: 'bitcoin-cash', ATOM: 'cosmos', UNI: 'uniswap',
+  NEAR: 'near', ICP: 'internet-computer',
+};
+
+function useLivePrice(asset: string | undefined): number | null {
+  const [price, setPrice] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!asset) return;
+    const coinId = COINGECKO_IDS[asset.toUpperCase()];
+    if (!coinId) return;
+
+    let cancelled = false;
+    const fetchPrice = async (): Promise<void> => {
+      try {
+        const res = await fetch(
+          `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd`
+        );
+        const data = await res.json();
+        const p = data[coinId]?.usd;
+        if (!cancelled && typeof p === 'number') setPrice(p);
+      } catch {
+        // Ignore transient ticker errors - not critical to functionality
+      }
+    };
+
+    fetchPrice();
+    const interval = setInterval(fetchPrice, 10000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [asset]);
+
+  return price;
+}
+
+type Direction = 'up' | 'down';
+
 export function Home() {
-  const [bets, setBets] = useState<BetsState>({0:'',1:'',2:'',3:'',4:'',5:'',6:'',7:'',8:'',9:''});
   const [userNametag, setUserNametag] = useState(loadNametag);
-  const [timeRemaining, setTimeRemaining] = useState<number | null>(null);
   const [nametagStatus, setNametagStatus] = useState<'idle' | 'checking' | 'valid' | 'invalid'>('idle');
   const [nametagError, setNametagError] = useState<string | null>(null);
   const [showConnectModal, setShowConnectModal] = useState(false);
-  const [showHistoryModal, setShowHistoryModal] = useState(false);
-  const [showMyBetsModal, setShowMyBetsModal] = useState(false);
   const [showHowToPlayModal, setShowHowToPlayModal] = useState(false);
+  const [selectedDirection, setSelectedDirection] = useState<Direction | null>(null);
+  const [betAmount, setBetAmount] = useState('');
+  const [timeRemaining, setTimeRemaining] = useState<number | null>(null);
   const [showPaymentModal, setShowPaymentModal] = useState(false);
   const [paymentStep, setPaymentStep] = useState<'confirm' | 'awaiting' | 'paid' | 'failed'>('confirm');
   const [pendingBetItems, setPendingBetItems] = useState<BetItem[]>([]);
   const [pendingBetId, setPendingBetId] = useState<string | null>(null);
   const [paymentError, setPaymentError] = useState<string | null>(null);
-  const [roundResult, setRoundResult] = useState<{ show: boolean; won: boolean } | null>(null);
-  const [isSpinning, setIsSpinning] = useState(false);
-  const [spinningDigit, setSpinningDigit] = useState<number>(0);
-  const [isWaitingForDraw, setIsWaitingForDraw] = useState(false);
+  const [roundResult, setRoundResult] = useState<{ won: boolean; direction: Direction } | null>(null);
+
   const queryClient = useQueryClient();
   const prevRoundNumberRef = useRef<number | null>(null);
-  const prevLockedBetsRef = useRef<Record<number, number>>({});
-  const lastWinningDigitRef = useRef<number | null>(null);
-  const lastPreviousRoundNumberRef = useRef<number | null>(null);
-  const hasInitializedRef = useRef(false);
-  const hasTriggeredDrawRef = useRef(false); // Prevent repeated triggers when timer=0
-  const animationStartTimeRef = useRef<number | null>(null); // Track when animation started
-  const waitingForRoundRef = useRef<number | null>(null); // Track which round we're waiting for
-  const inputRefs = useRef<(HTMLInputElement | null)[]>([]); // Refs for digit inputs
+  const lockedBetRef = useRef<{ direction: Direction; amount: number } | null>(null);
+  const hasHandledRoundRef = useRef<number | null>(null);
 
-  // Queries using custom hooks
-  const { data: round, isLoading } = useCurrentRound();
+  const { data: round } = useCurrentRound();
   const { data: previousRound } = usePreviousRound();
-  const { data: historyRounds } = useRoundHistory(config.historyLimit);
   const { data: myCurrentRoundBets } = useUserBetsInCurrentRound(
     nametagStatus === 'valid' ? userNametag : undefined
   );
-  // Get user's bet history to show win/loss in winning numbers
-  const { data: myBetsHistory } = useUserBets(
-    nametagStatus === 'valid' ? userNametag : undefined,
-    config.historyLimit
-  );
-  // Additional hooks for modals
-  const { data: allHistoryRounds, isLoading: isHistoryLoading } = useRoundHistory(50);
-  const { data: userBetsHistory, isLoading: isMyBetsLoading } = useUserBets(
-    nametagStatus === 'valid' ? userNametag : undefined,
-    100
-  );
-
-  // Mutation using custom hook
   const placeBetMutation = usePlaceBets();
+  const livePrice = useLivePrice(round?.asset);
 
-  // Create a map of roundNumber -> win result (true = won, false = lost, undefined = didn't play)
-  const roundResultsMap = new Map<number, boolean>();
-  if (myBetsHistory) {
-    for (const bet of myBetsHistory) {
-      if (bet.won !== null) {
-        roundResultsMap.set(bet.roundNumber, bet.won);
-      }
-    }
-  }
-
-  // Get winning history with round numbers for result lookup
-  const allHistoryWithRounds = historyRounds
-    ?.filter(r => r.winningDigit !== null)
-    .map(r => ({ digit: r.winningDigit as number, roundNumber: r.roundNumber })) || [];
-
-  // While spinning, don't show the latest winner in history (it will appear after animation)
-  const winningHistoryWithRounds = isSpinning
-    ? allHistoryWithRounds.slice(1, 13)
-    : allHistoryWithRounds.slice(0, 12);
-
-  // Keep prevLockedBetsRef in sync with server data for current round
+  // Track the user's locked-in bet for the current round, so we can show a
+  // result banner once it resolves (even after the round rolls over).
   useEffect(() => {
     if (myCurrentRoundBets && myCurrentRoundBets.length > 0) {
-      const aggregated = myCurrentRoundBets.reduce<Record<number, number>>((acc, bet) => {
-        bet.bets.forEach(b => {
-          acc[b.digit] = (acc[b.digit] || 0) + b.amount;
+      const totals: Record<Direction, number> = { up: 0, down: 0 };
+      myCurrentRoundBets.forEach((bet) => {
+        bet.bets.forEach((b) => {
+          totals[b.direction] += b.amount;
         });
-        return acc;
-      }, {});
-      prevLockedBetsRef.current = aggregated;
+      });
+      if (totals.up > 0) lockedBetRef.current = { direction: 'up', amount: totals.up };
+      else if (totals.down > 0) lockedBetRef.current = { direction: 'down', amount: totals.down };
     }
   }, [myCurrentRoundBets]);
 
-  // Initialize refs on first load (no animation on page load)
-  // Skip if animation is already running - let landing effect handle it
-  useEffect(() => {
-    if (isSpinning) return; // Don't interfere with running animation
-    if (!hasInitializedRef.current && previousRound?.winningDigit !== null && previousRound?.winningDigit !== undefined) {
-      hasInitializedRef.current = true;
-      lastWinningDigitRef.current = previousRound.winningDigit;
-      lastPreviousRoundNumberRef.current = previousRound.roundNumber ?? null;
-    }
-  }, [previousRound?.winningDigit, previousRound?.roundNumber, isSpinning]);
-
-  // Track round number changes - when new round starts, fetch latest data
+  // When the round number changes, the previous round just resolved - check
+  // whether our locked bet won and surface a result banner.
   useEffect(() => {
     if (!round?.roundNumber) return;
 
     if (prevRoundNumberRef.current !== null && prevRoundNumberRef.current !== round.roundNumber) {
-      // New round started! Refetch previousRound and history once
+      const resolvedRoundNumber = prevRoundNumberRef.current;
       queryClient.refetchQueries({ queryKey: ['previousRound'] });
       queryClient.refetchQueries({ queryKey: ['roundHistory'] });
+
+      if (lockedBetRef.current && hasHandledRoundRef.current !== resolvedRoundNumber) {
+        hasHandledRoundRef.current = resolvedRoundNumber;
+        const locked = lockedBetRef.current;
+
+        // Give the backend a moment to finish payout processing before checking
+        setTimeout(() => {
+          queryClient
+            .fetchQuery({ queryKey: ['previousRound'] })
+            .then((prev) => {
+              const p = prev as { roundNumber: number; winningDirection: Direction | 'flat' | null } | null;
+              if (p && p.roundNumber === resolvedRoundNumber && p.winningDirection) {
+                if (p.winningDirection === 'up' || p.winningDirection === 'down') {
+                  setRoundResult({ won: p.winningDirection === locked.direction, direction: locked.direction });
+                  setTimeout(() => setRoundResult(null), 6000);
+                }
+              }
+            })
+            .catch(() => {});
+          lockedBetRef.current = null;
+        }, 3000);
+      }
     }
 
     prevRoundNumberRef.current = round.roundNumber;
   }, [round?.roundNumber, queryClient]);
 
-  // Spinning effect - runs random digits while isSpinning is true
-  useEffect(() => {
-    if (!isSpinning) return;
-
-    const spinInterval = setInterval(() => {
-      setSpinningDigit(Math.floor(Math.random() * 10));
-    }, 100);
-
-    return () => clearInterval(spinInterval);
-  }, [isSpinning]);
-
-  // Landing effect - lands on winning digit when we have it AND min 2 seconds have passed
-  useEffect(() => {
-    if (!isSpinning) return;
-
-    const winningDigit = previousRound?.winningDigit;
-    const prevRoundNumber = previousRound?.roundNumber;
-
-    console.log('[Landing] isSpinning:', isSpinning, 'prevRound#:', prevRoundNumber, 'winningDigit:', winningDigit, 'waitingFor:', waitingForRoundRef.current);
-
-    // No winning digit yet - keep spinning
-    if (winningDigit === null || winningDigit === undefined) {
-      console.log('[Landing] No winning digit yet, keep spinning');
-      return;
-    }
-
-    // Check if this is the round we're waiting for
-    // If we're waiting for a specific round and this isn't it, keep spinning
-    if (waitingForRoundRef.current !== null && prevRoundNumber !== waitingForRoundRef.current) {
-      console.log('[Landing] Round mismatch! Got #', prevRoundNumber, 'but waiting for #', waitingForRoundRef.current);
-      return;
-    }
-
-    // Calculate remaining time to reach minimum 2 seconds
-    const startTime = animationStartTimeRef.current || Date.now();
-    const elapsed = Date.now() - startTime;
-    const minAnimationTime = 2000;
-    const remainingTime = Math.max(0, minAnimationTime - elapsed);
-
-    // Wait for remaining time, then land on winning digit
-    const timer = setTimeout(() => {
-      setSpinningDigit(winningDigit);
-      setIsSpinning(false);
-      setIsWaitingForDraw(false);
-
-      // Update refs
-      hasInitializedRef.current = true;
-      lastWinningDigitRef.current = winningDigit;
-      lastPreviousRoundNumberRef.current = prevRoundNumber ?? null;
-      waitingForRoundRef.current = null; // Clear waiting state
-
-      // Refetch all data after round ends
-      queryClient.refetchQueries({ queryKey: ['currentRound'] });
-      queryClient.refetchQueries({ queryKey: ['roundHistory'] });
-      queryClient.refetchQueries({ queryKey: ['userBetsCurrentRound'] });
-      queryClient.refetchQueries({ queryKey: ['userBets'] });
-
-      // Show win/loss result
-      const savedBets = prevLockedBetsRef.current;
-      const hadBets = Object.values(savedBets).some(v => v > 0);
-      if (hadBets) {
-        const betOnWinner = savedBets[winningDigit] || 0;
-        setRoundResult({ show: true, won: betOnWinner > 0 });
-        setTimeout(() => setRoundResult(null), 5000);
-      }
-
-      prevLockedBetsRef.current = {};
-    }, remainingTime);
-
-    return () => clearTimeout(timer);
-  }, [isSpinning, previousRound?.winningDigit, previousRound?.roundNumber, queryClient]);
-
-  // Poll for payment confirmation
+  // Poll for payment confirmation after placing a bet
   useEffect(() => {
     if (!pendingBetId || paymentStep !== 'awaiting') return;
 
     let pollCount = 0;
-    const maxPolls = 60; // 60 polls * 2 seconds = 2 minutes timeout
+    const maxPolls = 60; // 60 * 2s = 2 minute timeout
 
     const pollInterval = setInterval(async () => {
       pollCount++;
-
       try {
-        // First try current round
         const response = await gameApi.getUserBetsInCurrentRound(userNametag);
-        const currentBets = response.data.data;
-        let pendingBet = currentBets.find(b => b._id === pendingBetId);
+        let pendingBet = response.data.data.find((b) => b._id === pendingBetId);
 
-        // If not found in current round, check user's bet history (round may have closed)
         if (!pendingBet) {
           const historyResponse = await gameApi.getUserBets(userNametag, 10);
-          const historyBets = historyResponse.data.data;
-          pendingBet = historyBets.find(b => b._id === pendingBetId);
+          pendingBet = historyResponse.data.data.find((b) => b._id === pendingBetId);
         }
 
         if (pendingBet) {
           if (pendingBet.paymentStatus === 'paid') {
-            // Payment confirmed!
             clearInterval(pollInterval);
             setPaymentStep('paid');
-            queryClient.invalidateQueries({ queryKey: ['userBetsCurrentRound'] });
+            queryClient.invalidateQueries({ queryKey: ['userBetsInCurrentRound'] });
             queryClient.invalidateQueries({ queryKey: ['currentRound'] });
-            // Close modal after showing success
             setTimeout(() => {
               setShowPaymentModal(false);
               setPendingBetItems([]);
               setPendingBetId(null);
               setPaymentStep('confirm');
+              setSelectedDirection(null);
+              setBetAmount('');
             }, 1500);
-          } else if (pendingBet.paymentStatus === 'expired' || pendingBet.paymentStatus === 'failed' || pendingBet.paymentStatus === 'refunded') {
-            // Payment failed or refunded
+          } else if (
+            pendingBet.paymentStatus === 'expired' ||
+            pendingBet.paymentStatus === 'failed' ||
+            pendingBet.paymentStatus === 'refunded'
+          ) {
             clearInterval(pollInterval);
             setPaymentStep('failed');
             setPaymentError(
               pendingBet.paymentStatus === 'expired'
                 ? 'Payment expired. Please try again.'
                 : pendingBet.paymentStatus === 'refunded'
-                ? 'Round closed. Payment refunded to your wallet.'
-                : 'Payment failed. Please try again.'
+                  ? 'Round closed. Payment refunded to your wallet.'
+                  : 'Payment failed. Please try again.'
             );
           }
-          // If still 'pending', continue polling
         }
       } catch {
-        // Ignore polling errors, continue trying
+        // Ignore transient polling errors, keep trying
       }
 
-      // Timeout check
       if (pollCount >= maxPolls) {
         clearInterval(pollInterval);
         setPaymentStep('failed');
         setPaymentError('Payment timeout. Check your wallet and try again.');
       }
-    }, 2000); // Poll every 2 seconds
+    }, 2000);
 
     return () => clearInterval(pollInterval);
   }, [pendingBetId, paymentStep, userNametag, queryClient]);
-
-  // Polling for previousRound when waiting for draw result
-  useEffect(() => {
-    // Only poll while spinning (waiting for result)
-    if (!isSpinning) return;
-
-    // Poll every 500ms to get the winning digit until we land
-    const pollInterval = setInterval(() => {
-      console.log('[Polling] Fetching previousRound...');
-      queryClient.refetchQueries({ queryKey: ['previousRound'] });
-    }, 500);
-
-    return () => clearInterval(pollInterval);
-  }, [isSpinning, queryClient]);
 
   // Validate nametag
   const validateNametag = useCallback(async (nametag: string) => {
@@ -307,10 +228,8 @@ export function Home() {
       setNametagError(null);
       return;
     }
-
     setNametagStatus('checking');
     setNametagError(null);
-
     try {
       await gameApi.validateNametag(nametag);
       setNametagStatus('valid');
@@ -322,95 +241,52 @@ export function Home() {
     }
   }, []);
 
-  // Debounced validation
   useEffect(() => {
-    const timer = setTimeout(() => {
-      validateNametag(userNametag);
-    }, 500);
+    const timer = setTimeout(() => validateNametag(userNametag), 500);
     return () => clearTimeout(timer);
   }, [userNametag, validateNametag]);
 
-  // Timer effect
+  // Round countdown timer
   useEffect(() => {
     if (!round?.startTime || !round?.roundDurationSeconds) return;
 
-    // Reset the draw trigger for new round
-    hasTriggeredDrawRef.current = false;
-
-    const calculateRemaining = () => {
+    const calculateRemaining = (): number => {
       const startTime = new Date(round.startTime).getTime();
       const endTime = startTime + round.roundDurationSeconds! * 1000;
-      const now = Date.now();
-      return Math.max(0, Math.floor((endTime - now) / 1000));
+      return Math.max(0, Math.floor((endTime - Date.now()) / 1000));
     };
 
-    // Set initial value immediately
-    const initialRemaining = calculateRemaining();
-    setTimeRemaining(initialRemaining);
-
-    // If loading page with timer already at 0, trigger draw state once
-    if (initialRemaining === 0 && !hasTriggeredDrawRef.current && round?.roundNumber) {
-      hasTriggeredDrawRef.current = true;
-      setIsWaitingForDraw(true);
-      setIsSpinning(true);
-      animationStartTimeRef.current = Date.now();
-      waitingForRoundRef.current = round.roundNumber; // We're waiting for THIS round's result
-      queryClient.refetchQueries({ queryKey: ['previousRound'] });
-    }
-
-    const interval = setInterval(() => {
-      const remaining = calculateRemaining();
-      setTimeRemaining(remaining);
-
-      // When timer hits 0, start animation immediately
-      if (remaining === 0 && !hasTriggeredDrawRef.current && round?.roundNumber) {
-        hasTriggeredDrawRef.current = true;
-        setIsWaitingForDraw(true);
-        setIsSpinning(true);
-        animationStartTimeRef.current = Date.now();
-        waitingForRoundRef.current = round.roundNumber; // We're waiting for THIS round's result
-        queryClient.refetchQueries({ queryKey: ['previousRound'] });
-      }
-    }, 500);
-
+    setTimeRemaining(calculateRemaining());
+    const interval = setInterval(() => setTimeRemaining(calculateRemaining()), 1000);
     return () => clearInterval(interval);
-  }, [round?.startTime, round?.roundDurationSeconds, queryClient]);
+  }, [round?.startTime, round?.roundDurationSeconds]);
 
-  const handleInputChange = (digit: number, value: string): void => {
-    if (value === '' || /^\d{0,5}$/.test(value)) {
-      setBets(prev => ({ ...prev, [digit]: value }));
-    }
+  const handleNametagChange = (e: ChangeEvent<HTMLInputElement>): void => {
+    const value = e.target.value.trim();
+    setUserNametag(value);
+    saveNametag(value);
   };
 
-  const handleClearAll = (): void => {
-    setBets({0:'',1:'',2:'',3:'',4:'',5:'',6:'',7:'',8:'',9:''});
+  const handleSelectDirection = (direction: Direction): void => {
+    if (round?.status !== 'open') return;
+    setSelectedDirection(direction);
   };
 
-  const handlePlaceBet = (): void => {
+  const handlePlaceCall = (): void => {
     if (nametagStatus !== 'valid') {
       setShowConnectModal(true);
       return;
     }
+    const amount = parseInt(betAmount, 10);
+    if (!selectedDirection || isNaN(amount) || amount <= 0) return;
 
-    const betItems: BetItem[] = [];
-    for (let d = 0; d < 10; d++) {
-      const val = parseInt(bets[d], 10);
-      if (!isNaN(val) && val > 0) {
-        betItems.push({ digit: d, amount: val });
-      }
-    }
-
-    if (betItems.length > 0) {
-      // Show confirmation modal instead of placing bet directly
-      setPendingBetItems(betItems);
-      setPaymentStep('confirm');
-      setShowPaymentModal(true);
-    }
+    setPendingBetItems([{ direction: selectedDirection, amount }]);
+    setPaymentStep('confirm');
+    setShowPaymentModal(true);
   };
 
   const handleConfirmBet = (): void => {
     if (pendingBetItems.length === 0) return;
-
     setPaymentStep('awaiting');
     setPaymentError(null);
 
@@ -418,24 +294,19 @@ export function Home() {
       { userNametag, bets: pendingBetItems },
       {
         onSuccess: (data) => {
-          // Store the bet ID for polling
           setPendingBetId(data.bet._id);
-          // Clear the input fields
-          setBets({0:'',1:'',2:'',3:'',4:'',5:'',6:'',7:'',8:'',9:''});
-          // The polling effect will handle closing the modal when payment is confirmed
         },
         onError: (error: unknown) => {
-          const axiosError = error as { response?: { data?: { error?: string } }; message?: string };
-          const message = axiosError?.response?.data?.error || axiosError?.message || 'Unknown error';
-          // Show error in modal
           setPaymentStep('failed');
-          setPaymentError(message);
+          const axiosError = error as { response?: { data?: { error?: string } } };
+          setPaymentError(axiosError?.response?.data?.error || 'Failed to place your call. Please try again.');
         },
       }
     );
   };
 
-  const handleCancelBet = (): void => {
+  const closePaymentModal = (): void => {
+    if (paymentStep === 'awaiting') return; // Don't allow closing mid-payment
     setShowPaymentModal(false);
     setPendingBetItems([]);
     setPendingBetId(null);
@@ -443,1221 +314,408 @@ export function Home() {
     setPaymentError(null);
   };
 
-  const handleConnect = (): void => {
-    setShowConnectModal(true);
-  };
-
-  const handleConnectSubmit = (): void => {
-    if (nametagStatus === 'valid') {
-      saveNametag(userNametag);
-      setShowConnectModal(false);
-    }
-  };
-
-  const handleDisconnect = (): void => {
-    saveNametag('');
-    setUserNametag('');
-    setNametagStatus('idle');
-    setNametagError(null);
-  };
-
-  const currentBet = Object.values(bets).reduce((sum, val) => {
-    const num = parseInt(val, 10);
-    return sum + ((!isNaN(num) && num > 0) ? num : 0);
-  }, 0);
-
-  // Aggregate bets from database for current round
-  const myBetsAggregated = (myCurrentRoundBets || []).reduce<Record<number, number>>((acc, bet) => {
-    bet.bets.forEach(b => {
-      acc[b.digit] = (acc[b.digit] || 0) + b.amount;
-    });
-    return acc;
-  }, {});
-  const totalMyBets = Object.values(myBetsAggregated).reduce((sum, val) => sum + val, 0);
-
   const isRoundOpen = round?.status === 'open';
-  const canPlaceBet = currentBet > 0 && isRoundOpen && !placeBetMutation.isPending;
+  const myUpTotal = (myCurrentRoundBets ?? []).reduce(
+    (sum, bet) => sum + bet.bets.filter((b) => b.direction === 'up').reduce((s, b) => s + b.amount, 0),
+    0
+  );
+  const myDownTotal = (myCurrentRoundBets ?? []).reduce(
+    (sum, bet) => sum + bet.bets.filter((b) => b.direction === 'down').reduce((s, b) => s + b.amount, 0),
+    0
+  );
+  const hasLockedBetThisRound = myUpTotal > 0 || myDownTotal > 0;
 
-  // Show spinning digit during animation, otherwise show winning digit
-  const actualWinningDigit = previousRound?.winningDigit ?? null;
-  const displayDigit = isSpinning ? spinningDigit : actualWinningDigit;
-  const displayColor = displayDigit !== null ? DIGIT_COLORS[displayDigit] : '#00ff88';
-  const showResult = actualWinningDigit !== null;
+  const priceDelta = round?.startPrice && livePrice ? livePrice - round.startPrice : null;
+  const priceDeltaPct =
+    round?.startPrice && priceDelta !== null ? (priceDelta / round.startPrice) * 100 : null;
+  const totalBetAmount = pendingBetItems.reduce((sum, item) => sum + item.amount, 0);
 
   return (
-    <div className="lottery-container min-h-screen flex flex-col bg-linear-to-br from-[#0a0a0f] via-[#1a1a2e] to-[#0f0f1a] font-orbitron text-white relative overflow-x-hidden">
+    <div className="lottery-container min-h-screen bg-linear-to-br from-[#0a0a0f] via-[#1a1a2e] to-[#0f0f1a] text-white font-rajdhani relative">
       <div className="scanline" />
       <div className="grid-bg" />
 
       {/* Header */}
-      <header className="px-4 md:px-8 py-2.5 flex justify-between items-center border-b border-white/5 bg-black/30 backdrop-blur-sm">
-        <div className="flex items-center gap-2.5">
-          <div className="w-9 h-9 bg-linear-to-br from-[#00ff88] to-[#00cc6a] rounded-lg flex items-center justify-center text-lg font-black text-[#0a0a0f] shadow-[0_0_15px_#00ff8844]">
-            ?
-          </div>
-          <div>
-            <div className="text-sm font-extrabold tracking-widest bg-linear-to-r from-[#00ff88] to-[#00ffcc] bg-clip-text text-transparent">
-              {config.appName}
-            </div>
-            <div className="text-[10px] tracking-[3px] text-gray-500 font-rajdhani">{config.appSubtitle}</div>
-          </div>
+      <header className="relative px-6 py-4 flex justify-between items-center border-b border-white/5 bg-black/30">
+        <div>
+          <h1 className="text-xl font-bold font-orbitron text-[#00ff88] tracking-wider">
+            {config.appName}
+          </h1>
+          <p className="text-xs text-gray-500">{config.appSubtitle}</p>
         </div>
-
-        {nametagStatus === 'valid' ? (
-          <div className="flex items-center gap-2">
-            <span className="px-4 py-2 border-2 border-[#00ff88] text-[#00ff88] rounded-full font-orbitron text-xs font-semibold tracking-wide shadow-[0_0_10px_#00ff8833]">
-              {userNametag.toUpperCase()}
-            </span>
-            <button
-              onClick={handleDisconnect}
-              className="w-7 h-7 flex items-center justify-center text-gray-500 hover:text-[#ff6b6b] hover:border-[#ff6b6b] border border-gray-600 rounded-full transition-colors"
-              title="Disconnect"
-            >
-              <X size={14} />
-            </button>
-          </div>
-        ) : (
-          <button
-            onClick={handleConnect}
-            className="px-4 py-2 bg-transparent border-2 border-gray-500 text-gray-500 rounded-full font-orbitron text-xs font-semibold tracking-wide cursor-pointer hover:border-gray-400 hover:text-gray-400 transition-colors"
-          >
-            CONNECT
-          </button>
-        )}
-      </header>
-
-      {/* Winning History */}
-      <div className="py-2.5 md:py-3.5 px-4 md:px-8 border-b border-[#00ff8822] bg-linear-to-r from-[#00ff8808] via-transparent to-[#00ff8808] flex items-center justify-center gap-2 md:gap-4 flex-wrap">
-        <span className="text-gray-500 text-xs md:text-sm tracking-widest font-rajdhani font-semibold">
-          LAST WINNERS
-        </span>
-        <div className="flex gap-1.5 md:gap-2 flex-wrap justify-center">
-          {winningHistoryWithRounds.length > 0 ? winningHistoryWithRounds.slice(0, 8).map((item, i) => {
-            const result = roundResultsMap.get(item.roundNumber);
-            const isWin = result === true;
-            const played = result !== undefined;
-
-            return (
-              <div
-                key={i}
-                className="rounded-full flex items-center justify-center text-white font-bold font-orbitron relative shrink-0"
-                style={{
-                  width: i === 0 ? 32 : 26,
-                  height: i === 0 ? 32 : 26,
-                  background: DIGIT_COLORS[item.digit],
-                  fontSize: i === 0 ? 14 : 12,
-                  opacity: 1 - i * 0.06,
-                  boxShadow: i === 0
-                    ? `0 0 15px ${DIGIT_COLORS[item.digit]}88`
-                    : played
-                      ? isWin
-                        ? '0 0 8px #00ff88'
-                        : '0 0 8px #ff4444'
-                      : 'none',
-                  outline: played
-                    ? isWin
-                      ? '2px solid #00ff88'
-                      : '2px solid #ff4444'
-                    : 'none',
-                  outlineOffset: '2px'
-                }}
-              >
-                {item.digit}
-                {i === 0 && (
-                  <div className="absolute -top-1 -right-1 bg-white text-black text-[6px] font-bold px-0.5 py-0.5 rounded font-rajdhani leading-none">
-                    NEW
-                  </div>
-                )}
-                {/* Win/Loss indicator for played rounds */}
-                {played && i !== 0 && (
-                  <div
-                    className={`absolute -bottom-1 -right-1 w-3 h-3 rounded-full flex items-center justify-center text-[6px] font-bold ${
-                      isWin ? 'bg-green-500 text-white' : 'bg-red-500 text-white'
-                    }`}
-                  >
-                    {isWin ? '✓' : '✗'}
-                  </div>
-                )}
-              </div>
-            );
-          }) : (
-            <span className="text-gray-600 text-xs font-rajdhani">No history yet</span>
-          )}
-        </div>
-      </div>
-
-      {/* Main Content */}
-      <main className="flex-1 p-3 md:p-4 px-4 md:px-8 max-w-225 mx-auto w-full">
-        {/* Round Info & Timer */}
-        <div className="text-center mb-2">
-          {isLoading ? (
-            <div className="text-gray-500 text-sm font-rajdhani">Loading...</div>
-          ) : round ? (
-            <>
-              <div className="text-gray-500 text-sm tracking-[3px] mb-1 font-rajdhani">
-                ROUND #{round.roundNumber} • {round.status.toUpperCase()} • POOL: {round.totalPool} {config.tokenSymbol}
-              </div>
-              {isRoundOpen && timeRemaining !== null && !isWaitingForDraw && !isSpinning && (
-                <div className="text-5xl font-extrabold text-[#00ff88] drop-shadow-[0_0_40px_#00ff8866]">
-                  {formatTime(timeRemaining)}
-                </div>
-              )}
-              {(isWaitingForDraw || isSpinning) && (
-                <div className="text-5xl font-extrabold text-[#ffd700] drop-shadow-[0_0_40px_#ffd70066] animate-pulse">
-                  DRAWING...
-                </div>
-              )}
-              {!isRoundOpen && !isWaitingForDraw && !isSpinning && (
-                <div className="text-5xl font-extrabold text-[#ffd700] drop-shadow-[0_0_40px_#ffd70066]">
-                  {round.status === 'drawing' ? 'DRAWING...' : round.status === 'paying' ? 'PAYING OUT...' : 'CLOSED'}
-                </div>
-              )}
-            </>
-          ) : (
-            <div className="text-gray-500 text-sm font-rajdhani">No active round</div>
-          )}
-        </div>
-
-        {/* Spinner / Last Winner */}
-        <div className="text-center mb-2">
-          <div
-            className="w-36 h-36 md:w-42.5 md:h-42.5 mx-auto bg-linear-to-br from-[#0a0a0f] to-[#1a1a2e] rounded-full flex items-center justify-center relative"
-            style={{
-              border: `4px solid ${showResult ? displayColor : '#00ff8844'}`,
-              boxShadow: showResult
-                ? `0 0 40px ${displayColor}66, inset 0 0 40px ${displayColor}22`
-                : '0 0 40px #00ff8822, inset 0 0 40px #00000066'
-            }}
-          >
-            <div
-              className="absolute inset-2.5 rounded-full"
-              style={{ border: `2px solid ${showResult ? displayColor + '44' : '#00ff8833'}` }}
-            />
-            <div
-              className="absolute inset-5.5 rounded-full"
-              style={{ border: `1px solid ${showResult ? displayColor + '22' : '#00ff8822'}` }}
-            />
-            <span
-              className="text-[70px] md:text-[90px] font-black font-orbitron"
-              style={{
-                color: showResult ? displayColor : '#00ff88',
-                textShadow: `0 0 40px ${showResult ? displayColor : '#00ff88'}`
-              }}
-            >
-              {displayDigit !== null ? displayDigit : '?'}
-            </span>
-          </div>
-          {showResult && (
-            <div className="text-gray-500 text-xs font-rajdhani mt-2">
-              Previous round winner
-            </div>
-          )}
-        </div>
-
-        {/* Round Result - fixed height to prevent layout jump */}
-        <div className="h-8 md:h-12 flex items-center justify-center mb-1">
-          {roundResult?.show && (
-            <div className="text-center">
-              {roundResult.won ? (
-                <div className="text-2xl font-extrabold text-[#00ff88] drop-shadow-[0_0_20px_#00ff88]">
-                  YOU WIN!
-                </div>
-              ) : (
-                <div className="text-xl font-bold text-[#ff4444]">Better luck next time!</div>
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* Betting Area */}
-        <div className="bg-linear-to-br from-[#0f0f1a] to-[#1a1a2e] border border-white/5 rounded-2xl p-3 md:p-5 mb-2">
-          <div className="flex justify-between items-center mb-4">
-            <span className="text-gray-500 text-sm tracking-widest font-rajdhani">PLACE YOUR BETS</span>
-            {currentBet > 0 && (
-              <button
-                onClick={handleClearAll}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-[#ff6b6b]/10 border border-[#ff6b6b]/30 rounded-lg text-[#ff6b6b] text-xs font-rajdhani font-semibold tracking-wide hover:bg-[#ff6b6b]/20 hover:border-[#ff6b6b]/50 transition-all"
-              >
-                <X size={14} /> CLEAR
-              </button>
-            )}
-          </div>
-
-          {/* Mobile: 2 rows of 5 digits, Desktop: single row of 10 */}
-          <div className="grid grid-cols-5 md:grid-cols-10 gap-2 md:gap-2 mb-4">
-            {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(digit => {
-              const betVal = bets[digit];
-              const hasBet = parseInt(betVal, 10) > 0;
-              return (
-                <div key={digit}>
-                  <div
-                    className="flex flex-col items-center rounded-2xl md:rounded-3xl py-2 md:py-2 px-1 md:px-1 pb-2 cursor-pointer"
-                    onClick={() => inputRefs.current[digit]?.focus()}
-                    style={{
-                      background: hasBet ? `${DIGIT_COLORS[digit]}22` : '#15151f',
-                      border: `2px solid ${hasBet ? DIGIT_COLORS[digit] : '#222'}`
-                    }}
-                  >
-                    <div
-                      className="w-9 h-9 md:w-10 md:h-10 rounded-full flex items-center justify-center text-white font-bold text-base md:text-lg font-orbitron mb-1.5"
-                      style={{
-                        background: DIGIT_COLORS[digit],
-                        boxShadow: `0 4px 12px ${DIGIT_COLORS[digit]}44`
-                      }}
-                    >
-                      {digit}
-                    </div>
-                    <input
-                      ref={el => { inputRefs.current[digit] = el; }}
-                      type="text"
-                      inputMode="numeric"
-                      pattern="[0-9]*"
-                      value={betVal}
-                      onChange={(e: ChangeEvent<HTMLInputElement>) => handleInputChange(digit, e.target.value)}
-                      placeholder="0"
-                      disabled={!isRoundOpen}
-                      className="w-full py-2 md:py-1.5 px-1 bg-transparent border-0 border-t border-[#333] text-sm md:text-sm font-bold text-center outline-none font-rajdhani placeholder:text-gray-700"
-                      style={{ color: hasBet ? DIGIT_COLORS[digit] : '#666' }}
-                    />
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          <div className="flex items-center justify-center">
-            <button
-              onClick={handlePlaceBet}
-              disabled={!canPlaceBet}
-              className={`px-8 md:px-10 py-2.5 md:py-3 border-0 rounded-full text-xs md:text-sm font-bold font-orbitron tracking-widest ${
-                canPlaceBet
-                  ? 'bg-linear-to-br from-[#00ff88] to-[#00cc6a] text-[#0a0a0f] cursor-pointer shadow-[0_0_20px_#00ff8866]'
-                  : 'bg-[#333] text-gray-500 cursor-not-allowed'
-              }`}
-            >
-              {placeBetMutation.isPending
-                ? 'SENDING...'
-                : currentBet > 0
-                  ? `BET ${currentBet} ${config.tokenSymbol}`
-                  : 'PLACE BET'
-              }
-            </button>
-          </div>
-        </div>
-
-        {/* My Bets This Round */}
-        <div className="bg-linear-to-br from-[#0f0f1a] to-[#1a1a2e] border border-white/5 rounded-2xl p-3 md:p-4 px-4 md:px-5">
-          <div className="flex justify-between items-center mb-3">
-            <span className="text-gray-500 text-sm tracking-widest font-rajdhani">MY BETS THIS ROUND</span>
-            <div className="flex items-center gap-2">
-              <span className="text-gray-500 text-sm font-rajdhani">TOTAL:</span>
-              <span
-                className="text-lg font-bold font-orbitron"
-                style={{
-                  color: totalMyBets > 0 ? '#ffd700' : '#444',
-                  textShadow: totalMyBets > 0 ? '0 0 10px #ffd70044' : 'none'
-                }}
-              >
-                {totalMyBets} <span className="text-xs text-gray-400">{config.tokenSymbol}</span>
-              </span>
-            </div>
-          </div>
-
-          {totalMyBets > 0 ? (
-            <div className="grid grid-cols-5 md:grid-cols-10 gap-2">
-              {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(digit => {
-                const total = myBetsAggregated[digit] || 0;
-                return (
-                  <div
-                    key={digit}
-                    className="text-center"
-                    style={{ opacity: total > 0 ? 1 : 0.3 }}
-                  >
-                    <div
-                      className="w-9 h-9 md:w-8 md:h-8 mx-auto mb-1 rounded-full flex items-center justify-center font-bold text-sm md:text-[13px] font-orbitron"
-                      style={{
-                        background: total > 0 ? DIGIT_COLORS[digit] : '#1a1a2e',
-                        color: total > 0 ? '#fff' : '#444',
-                        boxShadow: total > 0 ? `0 0 10px ${DIGIT_COLORS[digit]}66` : 'none',
-                        border: total > 0 ? 'none' : '1px solid #333'
-                      }}
-                    >
-                      {digit}
-                    </div>
-                    <div
-                      className="text-sm md:text-xs font-bold font-rajdhani"
-                      style={{ color: total > 0 ? DIGIT_COLORS[digit] : '#333' }}
-                    >
-                      {total > 0 ? total : '-'}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          ) : nametagStatus === 'valid' ? (
-            <div className="text-gray-600 text-sm text-center py-3 font-rajdhani">
-              No bets placed yet
-            </div>
-          ) : (
-            <div className="text-gray-600 text-sm text-center py-3 font-rajdhani">
-              Connect wallet to see your bets
-            </div>
-          )}
-        </div>
-
-        </main>
-
-      {/* Footer */}
-      <footer className="py-2 md:py-3 px-3 md:px-8 flex items-center justify-between border-t border-white/5">
-        <div className="flex items-center gap-1.5 sm:gap-2 flex-1 min-w-0">
+        <div className="flex items-center gap-3">
           <button
             onClick={() => setShowHowToPlayModal(true)}
-            className="flex items-center justify-center gap-1 sm:gap-1.5 px-2.5 sm:px-3 md:px-4 py-1.5 md:py-2 bg-white/5 border border-white/10 rounded-lg text-gray-400 text-[11px] sm:text-xs md:text-sm font-rajdhani font-semibold tracking-wide hover:bg-white/10 hover:text-white hover:border-white/20 transition-all"
+            className="p-2 rounded-lg border border-white/10 text-gray-400 hover:text-white hover:border-white/30 transition-colors"
+            aria-label="How it works"
           >
-            <HelpCircle size={14} className="shrink-0" /> <span className="sm:hidden">?</span><span className="hidden sm:inline">HOW TO PLAY</span>
+            <HelpCircle size={18} />
+          </button>
+          <Link
+            to="/history"
+            className="p-2 rounded-lg border border-white/10 text-gray-400 hover:text-white hover:border-white/30 transition-colors"
+            aria-label="Round history"
+          >
+            <HistoryIcon size={18} />
+          </Link>
+          <button
+            onClick={() => setShowConnectModal(true)}
+            className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold transition-colors ${
+              nametagStatus === 'valid'
+                ? 'bg-[#00ff88]/10 border border-[#00ff88]/40 text-[#00ff88]'
+                : 'bg-white/5 border border-white/10 text-gray-400 hover:text-white'
+            }`}
+          >
+            <Wallet size={16} />
+            {nametagStatus === 'valid' ? `@${userNametag}` : 'Connect'}
+          </button>
+        </div>
+      </header>
+
+      <main className="relative max-w-md mx-auto p-4 pb-24">
+        {/* Round result banner */}
+        {roundResult && (
+          <div
+            className={`animate-slide-up mb-4 rounded-xl p-4 text-center border ${
+              roundResult.won
+                ? 'bg-[#00ff88]/10 border-[#00ff88]/40 text-[#00ff88]'
+                : 'bg-[#ff6b6b]/10 border-[#ff6b6b]/40 text-[#ff6b6b]'
+            }`}
+          >
+            <div className="font-orbitron font-bold text-lg tracking-wide">
+              {roundResult.won ? 'YOU CALLED IT RIGHT! 🎉' : 'NOT THIS ROUND'}
+            </div>
+            <div className="text-xs mt-1 opacity-80">
+              You called {roundResult.direction.toUpperCase()}
+            </div>
+          </div>
+        )}
+
+        {/* Price ticker card */}
+        <div className="rounded-2xl p-5 mb-4 bg-white/5 border border-white/10">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm font-semibold text-gray-400 font-orbitron tracking-widest">
+              {round?.asset ?? '...'}/USD
+            </span>
+            <span
+              className={`text-xs font-bold px-2 py-0.5 rounded-full ${
+                isRoundOpen ? 'bg-[#00ff88]/20 text-[#00ff88]' : 'bg-yellow-500/20 text-yellow-400'
+              }`}
+            >
+              {round?.status?.toUpperCase() ?? '...'}
+            </span>
+          </div>
+
+          <div className="text-3xl font-bold font-orbitron mb-1">
+            {livePrice !== null
+              ? `$${livePrice.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+              : round?.startPrice
+                ? `$${round.startPrice.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+                : '...'}
+          </div>
+
+          {priceDelta !== null && priceDeltaPct !== null && (
+            <div className={`text-sm font-semibold ${priceDelta >= 0 ? 'text-[#00ff88]' : 'text-[#ff6b6b]'}`}>
+              {priceDelta >= 0 ? '▲' : '▼'} {Math.abs(priceDeltaPct).toFixed(3)}% since round open
+            </div>
+          )}
+
+          <div className="mt-4 flex items-center justify-between text-sm">
+            <span className="text-gray-500">Round #{round?.roundNumber ?? '...'} closes in</span>
+            <span className="font-orbitron font-bold text-[#ffd700]">
+              {timeRemaining !== null ? formatTime(timeRemaining) : '--:--'}
+            </span>
+          </div>
+        </div>
+
+        {/* Up / Down selection */}
+        <div className="grid grid-cols-2 gap-3 mb-4">
+          <button
+            onClick={() => handleSelectDirection('up')}
+            disabled={!isRoundOpen}
+            className={`flex flex-col items-center gap-2 py-6 rounded-2xl border-2 transition-all disabled:opacity-40 ${
+              selectedDirection === 'up'
+                ? 'bg-[#00ff88]/15 border-[#00ff88]'
+                : 'bg-white/5 border-white/10 hover:border-[#00ff88]/40'
+            }`}
+          >
+            <TrendingUp size={32} className="text-[#00ff88]" />
+            <span className="font-orbitron font-bold text-[#00ff88] tracking-widest">UP</span>
           </button>
           <button
-            onClick={() => setShowHistoryModal(true)}
-            className="flex items-center justify-center gap-1 sm:gap-1.5 px-2.5 sm:px-3 md:px-4 py-1.5 md:py-2 bg-white/5 border border-white/10 rounded-lg text-gray-400 text-[11px] sm:text-xs md:text-sm font-rajdhani font-semibold tracking-wide hover:bg-white/10 hover:text-white hover:border-white/20 transition-all"
+            onClick={() => handleSelectDirection('down')}
+            disabled={!isRoundOpen}
+            className={`flex flex-col items-center gap-2 py-6 rounded-2xl border-2 transition-all disabled:opacity-40 ${
+              selectedDirection === 'down'
+                ? 'bg-[#ff6b6b]/15 border-[#ff6b6b]'
+                : 'bg-white/5 border-white/10 hover:border-[#ff6b6b]/40'
+            }`}
           >
-            <BarChart2 size={14} className="shrink-0" /> HISTORY
+            <TrendingDown size={32} className="text-[#ff6b6b]" />
+            <span className="font-orbitron font-bold text-[#ff6b6b] tracking-widest">DOWN</span>
           </button>
-          {userNametag && nametagStatus === 'valid' && (
-            <button
-              onClick={() => setShowMyBetsModal(true)}
-              className="flex items-center justify-center gap-1 sm:gap-1.5 px-2.5 sm:px-3 md:px-4 py-1.5 md:py-2 bg-white/5 border border-white/10 rounded-lg text-gray-400 text-[11px] sm:text-xs md:text-sm font-rajdhani font-semibold tracking-wide hover:bg-white/10 hover:text-white hover:border-white/20 transition-all"
-            >
-              <Dices size={14} className="shrink-0" /> BETS
-            </button>
-          )}
         </div>
-        <div className="text-gray-600 text-[10px] sm:text-xs md:text-sm font-rajdhani shrink-0 ml-2">
-          <span className="text-[#ffd700]">{config.tokenName}</span> <span className="hidden sm:inline">• 18+</span>
-        </div>
-      </footer>
 
-      {/* Connect Modal */}
-      {showConnectModal && (
-        <div className="fixed inset-0 bg-black/90 backdrop-blur-md flex items-center justify-center z-50">
-          {/* Modal Container */}
-          <div
-            className="relative w-full max-w-md mx-4 bg-linear-to-br from-[#0a0a0f] via-[#12121a] to-[#0a0a0f] rounded-2xl overflow-hidden"
-            style={{
-              boxShadow: '0 0 60px #00ff8822, 0 0 100px #00ff8811, inset 0 1px 0 #ffffff08'
+        {/* Amount input */}
+        <div className="rounded-2xl p-4 mb-4 bg-white/5 border border-white/10">
+          <label className="text-xs text-gray-500 mb-2 block">Amount ({config.tokenSymbol})</label>
+          <input
+            type="text"
+            inputMode="numeric"
+            value={betAmount}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (v === '' || /^\d{0,6}$/.test(v)) setBetAmount(v);
             }}
-          >
-            {/* Glowing border */}
-            <div
-              className="absolute inset-0 rounded-2xl pointer-events-none"
-              style={{
-                border: '1px solid #00ff8844',
-                boxShadow: 'inset 0 0 20px #00ff8811'
-              }}
-            />
+            placeholder="0"
+            className="w-full bg-transparent text-2xl font-bold font-orbitron outline-none placeholder-gray-700"
+          />
+        </div>
 
-            {/* Grid background */}
-            <div
-              className="absolute inset-0 opacity-10 pointer-events-none"
-              style={{
-                backgroundImage: 'linear-gradient(#00ff8808 1px, transparent 1px), linear-gradient(90deg, #00ff8808 1px, transparent 1px)',
-                backgroundSize: '20px 20px'
-              }}
-            />
+        {hasLockedBetThisRound && (
+          <div className="text-center text-xs text-gray-500 mb-4">
+            You've called {myUpTotal > 0 ? `UP (${myUpTotal} ${config.tokenSymbol})` : ''}
+            {myUpTotal > 0 && myDownTotal > 0 ? ' + ' : ''}
+            {myDownTotal > 0 ? `DOWN (${myDownTotal} ${config.tokenSymbol})` : ''} this round
+          </div>
+        )}
 
-            {/* Header */}
-            <div className="relative px-6 pt-5 pb-4 border-b border-[#00ff8822]">
-              <button
-                onClick={() => setShowConnectModal(false)}
-                className="absolute top-4 right-4 w-7 h-7 flex items-center justify-center text-gray-600 hover:text-white transition-colors rounded-full hover:bg-white/5"
-              >
-                <X size={18} />
-              </button>
+        <button
+          onClick={handlePlaceCall}
+          disabled={!isRoundOpen || !selectedDirection || !betAmount || parseInt(betAmount, 10) <= 0}
+          className="w-full py-4 rounded-2xl font-orbitron font-bold tracking-widest text-[#0a0a0f] disabled:opacity-30 disabled:cursor-not-allowed"
+          style={{
+            background: 'linear-gradient(135deg, #ffd700 0%, #ffaa00 100%)',
+            boxShadow: '0 4px 20px #ffd70033',
+          }}
+        >
+          {isRoundOpen ? 'PLACE CALL' : 'ROUND CLOSED'}
+        </button>
 
-              <div className="flex items-center gap-3">
-                <div
-                  className="w-9 h-9 rounded-lg flex items-center justify-center text-lg"
-                  style={{
-                    background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)',
-                    boxShadow: '0 0 15px #00ff8844'
-                  }}
-                >
-                  <span className="text-[#0a0a0f] font-black">?</span>
-                </div>
-                <div>
-                  <h2 className="text-sm font-extrabold text-white font-orbitron tracking-widest">
-                    CONNECT
-                  </h2>
-                  <p className="text-[10px] text-gray-500 font-rajdhani tracking-[3px]">
-                    NOSTR IDENTITY
-                  </p>
-                </div>
-              </div>
-            </div>
+        {/* Total pool */}
+        <div className="flex justify-between text-sm text-gray-500 mt-4 px-1">
+          <span>Pool this round</span>
+          <span className="text-[#ffd700] font-semibold">
+            {round?.totalPool ?? 0} {config.tokenSymbol}
+          </span>
+        </div>
 
-            {/* Content */}
-            <div className="relative px-6 py-5">
-              <p className="text-gray-500 text-sm font-rajdhani mb-5">
-                Enter your Nostr nametag to connect your wallet and start playing.
-              </p>
-
-              {/* Input Field */}
-              <div className="mb-4">
-                <label className="block text-sm text-gray-500 font-rajdhani tracking-widest mb-2">
-                  NAMETAG
-                </label>
-                <div className="relative">
-                  <div
-                    className="absolute inset-0 rounded-xl pointer-events-none transition-all duration-300"
-                    style={{
-                      boxShadow: nametagStatus === 'valid'
-                        ? '0 0 20px #00ff8833, inset 0 0 20px #00ff8811'
-                        : nametagStatus === 'invalid'
-                        ? '0 0 20px #ff6b6b33, inset 0 0 20px #ff6b6b11'
-                        : 'none'
-                    }}
-                  />
-                  <input
-                    type="text"
-                    placeholder="alice"
-                    value={userNametag}
-                    onChange={(e) => setUserNametag(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
-                    className={`w-full bg-[#0a0a0f] rounded-xl px-4 py-3 text-sm font-rajdhani font-semibold pr-12 outline-none transition-all duration-300 ${
-                      nametagStatus === 'valid' ? 'border-2 border-[#00ff88] text-[#00ff88]' :
-                      nametagStatus === 'invalid' ? 'border-2 border-[#ff6b6b] text-[#ff6b6b]' :
-                      'border-2 border-[#222] text-white focus:border-[#00ff8866]'
-                    }`}
-                  />
-                  <div className="absolute right-4 top-1/2 -translate-y-1/2">
-                    {nametagStatus === 'checking' && (
-                      <div className="w-5 h-5 border-2 border-gray-600 border-t-[#00ff88] rounded-full animate-spin" />
-                    )}
-                    {nametagStatus === 'valid' && (
-                      <div
-                        className="w-6 h-6 rounded-full flex items-center justify-center text-[#0a0a0f]"
-                        style={{
-                          background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)',
-                          boxShadow: '0 0 10px #00ff8866'
-                        }}
-                      >
-                        <Check size={14} strokeWidth={3} />
-                      </div>
-                    )}
-                    {nametagStatus === 'invalid' && (
-                      <div
-                        className="w-6 h-6 rounded-full flex items-center justify-center text-white"
-                        style={{
-                          background: 'linear-gradient(135deg, #ff6b6b 0%, #cc4444 100%)',
-                          boxShadow: '0 0 10px #ff6b6b66'
-                        }}
-                      >
-                        <X size={14} strokeWidth={3} />
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              {/* Error Message */}
-              {nametagError && (
-                <div
-                  className="mb-4 px-3 py-2.5 rounded-lg text-[#ff6b6b] text-sm font-rajdhani"
-                  style={{
-                    background: '#ff6b6b11',
-                    border: '1px solid #ff6b6b33'
-                  }}
-                >
-                  {nametagError}
-                </div>
-              )}
-
-              {/* Success State Info */}
-              {nametagStatus === 'valid' && (
-                <div
-                  className="mb-4 px-3 py-2.5 rounded-lg text-[#00ff88] text-sm font-rajdhani flex items-center gap-2"
-                  style={{
-                    background: '#00ff8811',
-                    border: '1px solid #00ff8833'
-                  }}
-                >
-                  <Check size={16} /> Nametag verified on Nostr network
-                </div>
-              )}
-            </div>
-
-            {/* Footer */}
-            <div className="relative px-6 pb-6 flex gap-3">
-              <button
-                onClick={() => setShowConnectModal(false)}
-                className="flex-1 px-4 py-3 bg-transparent border-2 border-[#333] rounded-xl text-gray-400 text-sm font-orbitron font-semibold tracking-widest hover:border-[#444] hover:text-gray-300 transition-all"
-              >
-                CANCEL
-              </button>
-              <button
-                onClick={handleConnectSubmit}
-                disabled={nametagStatus !== 'valid'}
-                className={`flex-1 px-4 py-3 rounded-xl text-sm font-orbitron font-bold tracking-widest transition-all ${
-                  nametagStatus === 'valid'
-                    ? 'text-[#0a0a0f] cursor-pointer'
-                    : 'bg-[#1a1a2e] text-gray-600 cursor-not-allowed border-2 border-[#222]'
+        {/* Previous round result */}
+        {previousRound && previousRound.winningDirection && (
+          <div className="mt-6 rounded-xl p-4 bg-white/5 border border-white/10 text-sm">
+            <div className="text-gray-500 mb-1">Last round #{previousRound.roundNumber}</div>
+            <div className="flex items-center justify-between">
+              <span
+                className={`font-orbitron font-bold ${
+                  previousRound.winningDirection === 'up' ? 'text-[#00ff88]' : 'text-[#ff6b6b]'
                 }`}
-                style={nametagStatus === 'valid' ? {
-                  background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)',
-                  boxShadow: '0 0 30px #00ff8844, 0 4px 15px #00ff8833'
-                } : {}}
               >
-                CONNECT
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* History Modal */}
-      {showHistoryModal && (
-        <div className="fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-end justify-center" onClick={() => setShowHistoryModal(false)}>
-          <div
-            className="w-full max-w-2xl max-h-[70vh] bg-linear-to-br from-[#0a0a0f] via-[#12121a] to-[#0a0a0f] rounded-t-2xl flex flex-col animate-slide-up relative overflow-hidden"
-            onClick={e => e.stopPropagation()}
-            style={{
-              boxShadow: '0 0 60px #00ff8822, inset 0 1px 0 #ffffff08'
-            }}
-          >
-            {/* Glowing border */}
-            <div
-              className="absolute inset-0 rounded-t-2xl pointer-events-none"
-              style={{ border: '1px solid #00ff8844', borderBottom: 'none' }}
-            />
-
-            {/* Grid background */}
-            <div
-              className="absolute inset-0 opacity-5 pointer-events-none"
-              style={{
-                backgroundImage: 'linear-gradient(#00ff8808 1px, transparent 1px), linear-gradient(90deg, #00ff8808 1px, transparent 1px)',
-                backgroundSize: '30px 30px'
-              }}
-            />
-
-            {/* Header */}
-            <div className="relative px-5 py-4 flex items-center justify-between border-b border-[#00ff8822]">
-              <div className="flex items-center gap-3">
-                <div
-                  className="w-8 h-8 rounded-lg flex items-center justify-center"
-                  style={{
-                    background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)',
-                    boxShadow: '0 0 15px #00ff8844'
-                  }}
-                >
-                  <BarChart2 size={16} className="text-[#0a0a0f]" />
-                </div>
-                <div className="leading-tight">
-                  <span className="text-lg font-bold text-white font-orbitron tracking-widest block">HISTORY</span>
-                  <p className="text-xs text-gray-500 font-rajdhani tracking-wider -mt-0.5">PAST ROUNDS</p>
-                </div>
-              </div>
-              <button
-                onClick={() => setShowHistoryModal(false)}
-                className="w-8 h-8 flex items-center justify-center text-gray-500 hover:text-white hover:bg-white/5 rounded-lg transition-colors"
-              >
-                <X size={18} />
-              </button>
-            </div>
-
-            {/* Content */}
-            <div className="relative px-4 py-4 overflow-y-auto flex-1">
-              {isHistoryLoading ? (
-                <div className="text-center py-8 text-gray-500 text-sm font-rajdhani">Loading...</div>
-              ) : !allHistoryRounds || allHistoryRounds.length === 0 ? (
-                <div className="text-center py-8 text-gray-500 text-sm font-rajdhani">No completed rounds yet</div>
-              ) : (
-                <div className="space-y-2">
-                  {allHistoryRounds.map((r, index) => (
-                    <div
-                      key={r._id}
-                      className="flex items-center gap-4 px-4 py-3 rounded-xl relative group"
-                      style={{
-                        background: index === 0 ? 'linear-gradient(135deg, #00ff8808 0%, transparent 100%)' : 'rgba(255,255,255,0.02)',
-                        border: index === 0 ? '1px solid #00ff8833' : '1px solid transparent'
-                      }}
-                    >
-                      {/* Round number */}
-                      <div className="flex flex-col items-center w-12 shrink-0">
-                        <span className="text-[10px] text-gray-600 font-rajdhani uppercase tracking-wider">Round</span>
-                        <span className="text-base text-gray-400 font-orbitron font-bold">
-                          {r.roundNumber}
-                        </span>
-                      </div>
-
-                      {/* Divider */}
-                      <div className="w-px h-8 bg-gradient-to-b from-transparent via-gray-700 to-transparent" />
-
-                      {/* Winning digit - larger and more prominent */}
-                      <div className="flex flex-col items-center">
-                        <span className="text-[10px] text-gray-600 font-rajdhani uppercase tracking-wider mb-1">Winner</span>
-                        {r.winningDigit !== null ? (
-                          <div
-                            className="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold text-lg font-orbitron"
-                            style={{
-                              background: `linear-gradient(135deg, ${DIGIT_COLORS[r.winningDigit]} 0%, ${DIGIT_COLORS[r.winningDigit]}cc 100%)`,
-                              boxShadow: `0 0 20px ${DIGIT_COLORS[r.winningDigit]}66, inset 0 1px 0 rgba(255,255,255,0.3)`
-                            }}
-                          >
-                            {r.winningDigit}
-                          </div>
-                        ) : (
-                          <div className="w-10 h-10 rounded-full bg-gray-800 flex items-center justify-center text-gray-500 font-bold text-lg font-orbitron border border-gray-700">?</div>
-                        )}
-                      </div>
-
-                      {/* Spacer */}
-                      <div className="flex-1" />
-
-                      {/* Pool */}
-                      <div className="text-right">
-                        <span className="text-[10px] text-gray-600 font-rajdhani uppercase tracking-wider block">Prize Pool</span>
-                        <span className="text-lg font-orbitron font-bold text-[#00ff88]" style={{ textShadow: '0 0 10px #00ff8844' }}>
-                          {r.totalPool}
-                        </span>
-                        <span className="text-xs text-gray-500 font-rajdhani ml-1">{config.tokenSymbol}</span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
+                {previousRound.winningDirection === 'up' ? '▲ UP' : previousRound.winningDirection === 'down' ? '▼ DOWN' : '– FLAT'}
+              </span>
+              {previousRound.startPrice !== null && previousRound.endPrice !== null && (
+                <span className="text-gray-500 text-xs">
+                  ${previousRound.startPrice.toLocaleString()} → ${previousRound.endPrice.toLocaleString()}
+                </span>
               )}
             </div>
           </div>
-        </div>
+        )}
+      </main>
+
+      {/* Footer nav */}
+      {nametagStatus === 'valid' && (
+        <Link
+          to={`/mybets/${userNametag}`}
+          className="fixed bottom-4 right-4 px-4 py-3 rounded-full bg-[#00ff88] text-[#0a0a0f] font-orbitron font-bold text-sm shadow-lg z-40"
+        >
+          My Calls
+        </Link>
       )}
 
-      {/* My Bets Modal */}
-      {showMyBetsModal && (
-        <div className="fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-end justify-center" onClick={() => setShowMyBetsModal(false)}>
-          <div
-            className="w-full max-w-2xl max-h-[70vh] bg-linear-to-br from-[#0a0a0f] via-[#12121a] to-[#0a0a0f] rounded-t-2xl flex flex-col animate-slide-up relative overflow-hidden"
-            onClick={e => e.stopPropagation()}
-            style={{
-              boxShadow: '0 0 60px #00ff8822, inset 0 1px 0 #ffffff08'
-            }}
-          >
-            {/* Glowing border */}
-            <div
-              className="absolute inset-0 rounded-t-2xl pointer-events-none"
-              style={{ border: '1px solid #00ff8844', borderBottom: 'none' }}
+      {/* Connect nametag modal */}
+      {showConnectModal && (
+        <div className="fixed inset-0 bg-black/90 backdrop-blur-md flex items-center justify-center z-50 px-4">
+          <div className="relative w-full max-w-sm bg-linear-to-br from-[#0a0a0f] via-[#12121a] to-[#0a0a0f] rounded-2xl border border-white/10 p-6">
+            <button
+              onClick={() => setShowConnectModal(false)}
+              className="absolute top-4 right-4 text-gray-500 hover:text-white"
+              aria-label="Close"
+            >
+              <X size={20} />
+            </button>
+            <h2 className="text-lg font-bold font-orbitron text-[#00ff88] mb-1">Connect Nametag</h2>
+            <p className="text-xs text-gray-500 mb-4">Enter your Sphere nametag to place calls</p>
+            <input
+              type="text"
+              value={userNametag}
+              onChange={handleNametagChange}
+              placeholder="your-nametag"
+              className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 outline-none focus:border-[#00ff88]/50 mb-2"
             />
-
-            {/* Grid background */}
-            <div
-              className="absolute inset-0 opacity-5 pointer-events-none"
-              style={{
-                backgroundImage: 'linear-gradient(#00ff8808 1px, transparent 1px), linear-gradient(90deg, #00ff8808 1px, transparent 1px)',
-                backgroundSize: '30px 30px'
-              }}
-            />
-
-            {/* Header */}
-            <div className="relative px-5 py-4 flex items-center justify-between border-b border-[#00ff8822]">
-              <div className="flex items-center gap-3">
-                <div
-                  className="w-8 h-8 rounded-lg flex items-center justify-center"
-                  style={{
-                    background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)',
-                    boxShadow: '0 0 15px #00ff8844'
-                  }}
-                >
-                  <Dices size={16} className="text-[#0a0a0f]" />
-                </div>
-                <div className="leading-tight">
-                  <span className="text-lg font-bold text-white font-orbitron tracking-widest block">MY BETS</span>
-                  <p className="text-xs text-gray-500 font-rajdhani tracking-wider -mt-0.5">@{userNametag.toUpperCase()}</p>
-                </div>
-              </div>
-              <button
-                onClick={() => setShowMyBetsModal(false)}
-                className="w-8 h-8 flex items-center justify-center text-gray-500 hover:text-white hover:bg-white/5 rounded-lg transition-colors"
-              >
-                <X size={18} />
-              </button>
-            </div>
-
-            {/* Content */}
-            <div className="relative px-4 py-4 overflow-y-auto flex-1">
-              {isMyBetsLoading ? (
-                <div className="text-center py-8 text-gray-500 text-sm font-rajdhani">Loading...</div>
-              ) : !userBetsHistory || userBetsHistory.length === 0 ? (
-                <div className="text-center py-8 text-gray-500 text-sm font-rajdhani">No bets yet</div>
-              ) : (
-                <div className="space-y-2">
-                  {userBetsHistory.map((bet, index) => {
-                    const roundInfo = typeof bet.roundId === 'object' && bet.roundId !== null
-                      ? { roundNumber: (bet.roundId as Round).roundNumber, winningDigit: (bet.roundId as Round).winningDigit }
-                      : { roundNumber: bet.roundNumber, winningDigit: null };
-                    const isWinner = bet.won === true;
-                    const isLoser = bet.won === false;
-
-                    // Refunded bets are not "open" - they're cancelled
-                    const isRefunded = bet.paymentStatus === 'refunded';
-                    const isPending = !isWinner && !isLoser && !isRefunded && bet.paymentStatus === 'paid';
-
-                    return (
-                      <div
-                        key={bet._id}
-                        className="flex items-center gap-3 px-4 py-3 rounded-xl relative group"
-                        style={{
-                          background: index === 0
-                            ? isWinner ? 'linear-gradient(135deg, #00ff8815 0%, transparent 100%)' : isPending ? 'linear-gradient(135deg, #ffd70015 0%, transparent 100%)' : 'rgba(255,255,255,0.02)'
-                            : 'rgba(255,255,255,0.02)',
-                          border: index === 0
-                            ? isWinner ? '1px solid #00ff8833' : isPending ? '1px solid #ffd70033' : '1px solid transparent'
-                            : '1px solid transparent'
-                        }}
-                      >
-                        {/* Result badge */}
-                        <span className={`text-sm font-orbitron font-bold w-12 shrink-0 ${
-                          isWinner ? 'text-green-400' : isPending ? 'text-yellow-400' : isRefunded ? 'text-blue-400' : 'text-gray-500'
-                        }`}>
-                          {isWinner ? 'WIN' : isPending ? 'OPEN' : isRefunded ? 'RFND' : 'LOSS'}
-                        </span>
-
-                        {/* Divider */}
-                        <div className="w-px h-10 bg-gradient-to-b from-transparent via-gray-700 to-transparent" />
-
-                        {/* Round number */}
-                        <span className="text-base text-gray-500 font-rajdhani font-semibold w-10 shrink-0">
-                          #{roundInfo.roundNumber}
-                        </span>
-
-                        {/* Divider */}
-                        <div className="w-px h-10 bg-gradient-to-b from-transparent via-gray-700 to-transparent" />
-
-                        {/* Bet digits */}
-                        <div className="flex gap-1">
-                          {bet.bets.map((b, i) => {
-                            const isWinningDigit = roundInfo.winningDigit === b.digit;
-                            return (
-                              <div
-                                key={i}
-                                className="w-8 h-8 rounded-full flex items-center justify-center text-white font-bold text-xs font-orbitron"
-                                style={{
-                                  background: `linear-gradient(135deg, ${DIGIT_COLORS[b.digit]} 0%, ${DIGIT_COLORS[b.digit]}cc 100%)`,
-                                  opacity: isWinner ? (isWinningDigit ? 1 : 0.3) : 0.85,
-                                  boxShadow: isWinningDigit ? `0 0 12px ${DIGIT_COLORS[b.digit]}66, inset 0 1px 0 rgba(255,255,255,0.3)` : 'inset 0 1px 0 rgba(255,255,255,0.2)'
-                                }}
-                              >
-                                {b.digit}
-                              </div>
-                            );
-                          })}
-                        </div>
-
-                        {/* Spacer */}
-                        <div className="flex-1 min-w-2" />
-
-                        {/* Amount */}
-                        <div className="text-right shrink-0">
-                          {isWinner ? (
-                            <span className="text-lg font-orbitron font-bold text-[#00ff88]" style={{ textShadow: '0 0 10px #00ff8844' }}>
-                              +{bet.winnings}
-                              <span className="text-xs text-gray-500 font-rajdhani ml-1">{config.tokenSymbol}</span>
-                            </span>
-                          ) : (
-                            <span className="text-lg font-orbitron font-bold text-gray-400">
-                              {bet.totalAmount}
-                              <span className="text-xs text-gray-500 font-rajdhani ml-1">{config.tokenSymbol}</span>
-                            </span>
-                          )}
-                        </div>
-
-                        {/* Payment status - only show if not paid */}
-                        {bet.paymentStatus !== 'paid' && (
-                          <span className={`text-xs font-bold font-rajdhani shrink-0 ${
-                            bet.paymentStatus === 'pending' ? 'text-yellow-400' :
-                            bet.paymentStatus === 'refunded' ? 'text-blue-400' :
-                            'text-red-400'
-                          }`}>
-                            {bet.paymentStatus.toUpperCase()}
-                          </span>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
+            {nametagStatus === 'checking' && (
+              <p className="text-xs text-gray-500">Checking...</p>
+            )}
+            {nametagStatus === 'valid' && (
+              <p className="text-xs text-[#00ff88] flex items-center gap-1">
+                <Check size={14} /> Nametag verified
+              </p>
+            )}
+            {nametagStatus === 'invalid' && (
+              <p className="text-xs text-[#ff6b6b]">{nametagError}</p>
+            )}
+            <button
+              onClick={() => setShowConnectModal(false)}
+              disabled={nametagStatus !== 'valid'}
+              className="w-full mt-4 py-3 rounded-xl font-orbitron font-bold text-[#0a0a0f] disabled:opacity-30"
+              style={{ background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)' }}
+            >
+              DONE
+            </button>
           </div>
         </div>
       )}
 
-      {/* How To Play Modal */}
+      {/* How to play modal */}
       {showHowToPlayModal && (
-        <div className="fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-end justify-center" onClick={() => setShowHowToPlayModal(false)}>
-          <div
-            className="w-full max-w-2xl max-h-[85vh] bg-linear-to-br from-[#0a0a0f] via-[#12121a] to-[#0a0a0f] rounded-t-2xl flex flex-col animate-slide-up relative overflow-hidden"
-            onClick={e => e.stopPropagation()}
-            style={{
-              boxShadow: '0 0 60px #00ff8822, inset 0 1px 0 #ffffff08'
-            }}
-          >
-            {/* Glowing border */}
-            <div
-              className="absolute inset-0 rounded-t-2xl pointer-events-none"
-              style={{ border: '1px solid #00ff8844', borderBottom: 'none' }}
-            />
-
-            {/* Grid background */}
-            <div
-              className="absolute inset-0 opacity-5 pointer-events-none"
-              style={{
-                backgroundImage: 'linear-gradient(#00ff8808 1px, transparent 1px), linear-gradient(90deg, #00ff8808 1px, transparent 1px)',
-                backgroundSize: '30px 30px'
-              }}
-            />
-
-            {/* Header */}
-            <div className="relative px-5 py-4 flex items-center justify-between border-b border-[#00ff8822]">
-              <div className="flex items-center gap-3">
-                <div
-                  className="w-8 h-8 rounded-lg flex items-center justify-center"
-                  style={{
-                    background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)',
-                    boxShadow: '0 0 15px #00ff8844'
-                  }}
-                >
-                  <Target size={16} className="text-[#0a0a0f]" />
-                </div>
-                <div className="leading-tight">
-                  <span className="text-lg font-bold text-white font-orbitron tracking-widest block">HOW TO PLAY</span>
-                  <p className="text-xs text-gray-500 font-rajdhani tracking-wider -mt-0.5">GAME GUIDE</p>
-                </div>
-              </div>
-              <button
-                onClick={() => setShowHowToPlayModal(false)}
-                className="w-8 h-8 flex items-center justify-center text-gray-500 hover:text-white hover:bg-white/5 rounded-lg transition-colors"
-              >
-                <X size={18} />
-              </button>
-            </div>
-
-            {/* Content */}
-            <div className="relative px-5 py-6 overflow-y-auto flex-1">
-              {/* Step 1 */}
-              <div className="mb-6">
-                <div className="flex items-center gap-3 mb-2">
-                  <div className="w-8 h-8 rounded-full bg-[#00ff88] text-[#0a0a0f] flex items-center justify-center text-base font-bold font-orbitron">1</div>
-                  <h3 className="text-base font-bold text-white font-rajdhani">Connect Your Wallet</h3>
-                </div>
-                <p className="text-sm text-gray-400 font-rajdhani ml-11">
-                  Enter your Nostr nametag to connect. This links your identity to receive winnings automatically.
-                </p>
-              </div>
-
-              {/* Step 2 */}
-              <div className="mb-6">
-                <div className="flex items-center gap-3 mb-2">
-                  <div className="w-8 h-8 rounded-full bg-[#00ff88] text-[#0a0a0f] flex items-center justify-center text-base font-bold font-orbitron">2</div>
-                  <h3 className="text-base font-bold text-white font-rajdhani">Place Your Bets</h3>
-                </div>
-                <p className="text-sm text-gray-400 font-rajdhani ml-11">
-                  Choose any digit from 0-9 and enter your bet amount. You can bet on multiple digits in a single round.
-                </p>
-                <div className="ml-11 mt-2 flex gap-1.5">
-                  {[0,1,2,3,4,5,6,7,8,9].map(d => (
-                    <div key={d} className="w-7 h-7 rounded-full flex items-center justify-center text-white text-sm font-bold font-orbitron" style={{ background: DIGIT_COLORS[d] }}>{d}</div>
-                  ))}
-                </div>
-              </div>
-
-              {/* Step 3 */}
-              <div className="mb-6">
-                <div className="flex items-center gap-3 mb-2">
-                  <div className="w-8 h-8 rounded-full bg-[#00ff88] text-[#0a0a0f] flex items-center justify-center text-base font-bold font-orbitron">3</div>
-                  <h3 className="text-base font-bold text-white font-rajdhani">Confirm Payment</h3>
-                </div>
-                <p className="text-sm text-gray-400 font-rajdhani ml-11">
-                  After placing your bet, a payment request will be sent to your wallet. Confirm the payment to lock in your bet.
-                </p>
-              </div>
-
-              {/* Step 4 */}
-              <div className="mb-6">
-                <div className="flex items-center gap-3 mb-2">
-                  <div className="w-8 h-8 rounded-full bg-[#00ff88] text-[#0a0a0f] flex items-center justify-center text-base font-bold font-orbitron">4</div>
-                  <h3 className="text-base font-bold text-white font-rajdhani">Wait for the Draw</h3>
-                </div>
-                <p className="text-sm text-gray-400 font-rajdhani ml-11">
-                  Each round has a countdown timer. When it reaches zero, a random winning digit is drawn.
-                </p>
-              </div>
-
-              {/* Step 5 */}
-              <div className="mb-8">
-                <div className="flex items-center gap-3 mb-2">
-                  <div className="w-8 h-8 rounded-full bg-[#00ff88] text-[#0a0a0f] flex items-center justify-center text-base font-bold font-orbitron">5</div>
-                  <h3 className="text-base font-bold text-white font-rajdhani">Collect Winnings</h3>
-                </div>
-                <p className="text-sm text-gray-400 font-rajdhani ml-11">
-                  If your digit wins, you share the pool with other winners! Winnings are sent automatically to your wallet.
-                </p>
-              </div>
-
-              {/* Pari-mutuel explanation */}
-              <div
-                className="rounded-xl p-5 relative overflow-hidden"
-                style={{
-                  background: 'linear-gradient(135deg, #ffd70008 0%, transparent 100%)',
-                  border: '1px solid #ffd70033'
-                }}
-              >
-                <div className="flex items-center gap-2 mb-3">
-                  <Lightbulb size={18} className="text-[#ffd700]" />
-                  <h4 className="text-base font-bold text-[#ffd700] font-orbitron tracking-wider">PARI-MUTUEL</h4>
-                </div>
-                <p className="text-sm text-gray-400 font-rajdhani leading-relaxed">
-                  All bets go into a shared pool. Winners split the entire pool proportionally based on their bet amounts.
-                  The more you bet on the winning digit, the larger your share of the pot!
-                </p>
-                <div className="mt-4 flex items-center gap-3 text-sm font-rajdhani flex-wrap">
-                  <span className="text-[#ffd700] font-semibold">100 {config.tokenSymbol} pool</span>
-                  <span className="text-gray-600">→</span>
-                  <span className="text-white">Your bet: 10</span>
-                  <span className="text-gray-600">→</span>
-                  <span className="text-[#00ff88] font-semibold">Win your share!</span>
-                </div>
-              </div>
-            </div>
-
-            {/* Footer with button - always visible */}
-            <div className="relative px-5 py-4 border-t border-[#00ff8822]">
-              <button
-                onClick={() => setShowHowToPlayModal(false)}
-                className="w-full py-3.5 rounded-xl text-[#0a0a0f] text-sm font-bold font-orbitron tracking-widest"
-                style={{
-                  background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)',
-                  boxShadow: '0 0 30px #00ff8844, 0 4px 15px #00ff8833'
-                }}
-              >
-                START PLAYING
-              </button>
-            </div>
+        <div className="fixed inset-0 bg-black/90 backdrop-blur-md flex items-center justify-center z-50 px-4">
+          <div className="relative w-full max-w-sm bg-linear-to-br from-[#0a0a0f] via-[#12121a] to-[#0a0a0f] rounded-2xl border border-white/10 p-6">
+            <button
+              onClick={() => setShowHowToPlayModal(false)}
+              className="absolute top-4 right-4 text-gray-500 hover:text-white"
+              aria-label="Close"
+            >
+              <X size={20} />
+            </button>
+            <h2 className="text-lg font-bold font-orbitron text-[#00ff88] mb-4">How It Works</h2>
+            <ol className="text-sm text-gray-400 space-y-3 list-decimal list-inside">
+              <li>Each round captures the live {round?.asset ?? 'asset'} price the moment it opens.</li>
+              <li>Call whether the price will be UP or DOWN when the round closes.</li>
+              <li>When the round ends, the live price is checked again to resolve the winning side.</li>
+              <li>Winners split the pool proportionally, minus a small house fee.</li>
+            </ol>
           </div>
         </div>
       )}
 
-      {/* Payment Confirmation Modal */}
+      {/* Payment modal */}
       {showPaymentModal && (
-        <div className="fixed inset-0 bg-black/90 backdrop-blur-md flex items-center justify-center z-50">
+        <div className="fixed inset-0 bg-black/90 backdrop-blur-md flex items-center justify-center z-50 px-4">
           <div
-            className="relative w-full max-w-sm mx-4 bg-linear-to-br from-[#0a0a0f] via-[#12121a] to-[#0a0a0f] rounded-2xl overflow-hidden"
-            style={{
-              boxShadow: '0 0 60px #00ff8822, 0 0 100px #00ff8811, inset 0 1px 0 #ffffff08'
-            }}
+            className="relative w-full max-w-sm bg-linear-to-br from-[#0a0a0f] via-[#12121a] to-[#0a0a0f] rounded-2xl overflow-hidden"
+            style={{ boxShadow: '0 0 60px #00ff8822, 0 0 100px #00ff8811, inset 0 1px 0 #ffffff08' }}
           >
-            {/* Glowing border */}
-            <div
-              className="absolute inset-0 rounded-2xl pointer-events-none"
-              style={{
-                border: '1px solid #00ff8844',
-                boxShadow: 'inset 0 0 20px #00ff8811'
-              }}
-            />
-
-            {/* Grid background */}
-            <div
-              className="absolute inset-0 opacity-10 pointer-events-none"
-              style={{
-                backgroundImage: 'linear-gradient(#00ff8808 1px, transparent 1px), linear-gradient(90deg, #00ff8808 1px, transparent 1px)',
-                backgroundSize: '20px 20px'
-              }}
-            />
-
-            {/* Content */}
             <div className="relative px-6 py-6">
               {paymentStep === 'confirm' ? (
                 <>
-                  {/* Header */}
                   <div className="text-center mb-6">
                     <div
                       className="w-14 h-14 mx-auto mb-3 rounded-xl flex items-center justify-center"
                       style={{
-                        background: 'linear-gradient(135deg, #ffd700 0%, #ffaa00 100%)',
-                        boxShadow: '0 0 30px #ffd70044'
+                        background:
+                          pendingBetItems[0]?.direction === 'up'
+                            ? 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)'
+                            : 'linear-gradient(135deg, #ff6b6b 0%, #cc4444 100%)',
                       }}
                     >
-                      <Dices size={28} className="text-[#0a0a0f]" />
+                      {pendingBetItems[0]?.direction === 'up' ? (
+                        <TrendingUp size={28} className="text-[#0a0a0f]" />
+                      ) : (
+                        <TrendingDown size={28} className="text-white" />
+                      )}
                     </div>
                     <h2 className="text-lg font-bold text-white font-orbitron tracking-widest">
-                      CONFIRM BET
+                      CONFIRM CALL
                     </h2>
-                    <p className="text-xs text-gray-500 font-rajdhani mt-1">
-                      Round #{round?.roundNumber}
-                    </p>
+                    <p className="text-xs text-gray-500 mt-1">Round #{round?.roundNumber}</p>
                   </div>
 
-                  {/* Bet Summary */}
-                  <div className="mb-6">
-                    <div className="flex justify-center gap-2 mb-4 flex-wrap">
-                      {pendingBetItems.map((item, i) => (
-                        <div
-                          key={i}
-                          className="flex items-center gap-2 px-3 py-1.5 rounded-full"
-                          style={{
-                            background: `${DIGIT_COLORS[item.digit]}22`,
-                            border: `1px solid ${DIGIT_COLORS[item.digit]}66`
-                          }}
-                        >
-                          <div
-                            className="w-6 h-6 rounded-full flex items-center justify-center text-white font-bold text-xs font-orbitron"
-                            style={{ background: DIGIT_COLORS[item.digit] }}
-                          >
-                            {item.digit}
-                          </div>
-                          <span className="text-sm font-semibold font-rajdhani" style={{ color: DIGIT_COLORS[item.digit] }}>
-                            {item.amount}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-
-                    {/* Total */}
-                    <div
-                      className="text-center py-3 rounded-xl"
-                      style={{
-                        background: 'linear-gradient(135deg, #ffd70011 0%, transparent 100%)',
-                        border: '1px solid #ffd70033'
-                      }}
-                    >
-                      <span className="text-gray-400 text-sm font-rajdhani">Total: </span>
-                      <span className="text-2xl font-bold font-orbitron text-[#ffd700]" style={{ textShadow: '0 0 20px #ffd70044' }}>
-                        {pendingBetItems.reduce((sum, item) => sum + item.amount, 0)}
+                  <div className="text-center py-3 rounded-xl mb-6 bg-white/5 border border-white/10">
+                    <div className="text-sm text-gray-400 mb-1">
+                      Calling {round?.asset} to go{' '}
+                      <span
+                        className={
+                          pendingBetItems[0]?.direction === 'up' ? 'text-[#00ff88]' : 'text-[#ff6b6b]'
+                        }
+                      >
+                        {pendingBetItems[0]?.direction?.toUpperCase()}
                       </span>
-                      <span className="text-sm text-gray-400 font-rajdhani ml-1">{config.tokenSymbol}</span>
                     </div>
+                    <span className="text-2xl font-bold font-orbitron text-[#ffd700]">
+                      {totalBetAmount}
+                    </span>
+                    <span className="text-sm text-gray-400 ml-1">{config.tokenSymbol}</span>
                   </div>
 
-                  {/* Buttons */}
                   <div className="flex gap-3">
                     <button
-                      onClick={handleCancelBet}
-                      className="flex-1 px-4 py-3 bg-transparent border-2 border-[#333] rounded-xl text-gray-400 text-sm font-orbitron font-semibold tracking-widest hover:border-[#444] hover:text-gray-300 transition-all"
+                      onClick={closePaymentModal}
+                      className="flex-1 px-4 py-3 bg-transparent border-2 border-[#333] rounded-xl text-gray-400 text-sm font-orbitron font-semibold tracking-widest hover:border-[#444]"
                     >
                       CANCEL
                     </button>
                     <button
                       onClick={handleConfirmBet}
                       className="flex-1 px-4 py-3 rounded-xl text-[#0a0a0f] text-sm font-orbitron font-bold tracking-widest"
-                      style={{
-                        background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)',
-                        boxShadow: '0 0 30px #00ff8844, 0 4px 15px #00ff8833'
-                      }}
+                      style={{ background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)' }}
                     >
                       CONFIRM
                     </button>
                   </div>
                 </>
               ) : paymentStep === 'awaiting' ? (
-                <>
-                  {/* Awaiting Payment State */}
-                  <div className="text-center py-4">
-                    <div className="w-16 h-16 mx-auto mb-4 relative">
-                      {/* Spinning ring */}
-                      <div
-                        className="absolute inset-0 rounded-full border-4 border-transparent animate-spin"
-                        style={{
-                          borderTopColor: '#00ff88',
-                          borderRightColor: '#00ff8866',
-                          animationDuration: '1s'
-                        }}
-                      />
-                      {/* Inner glow */}
-                      <div
-                        className="absolute inset-2 rounded-full flex items-center justify-center"
-                        style={{
-                          background: 'radial-gradient(circle, #00ff8822 0%, transparent 70%)'
-                        }}
-                      >
-                        <div className="w-6 h-6 rounded-full bg-[#00ff88] animate-pulse" />
-                      </div>
-                    </div>
-
-                    <h2 className="text-base font-bold text-[#00ff88] font-orbitron tracking-widest mb-2">
-                      AWAITING PAYMENT
-                    </h2>
-                    <p className="text-sm text-gray-400 font-rajdhani mb-1">
-                      Check your wallet for the payment request
-                    </p>
-                    <p className="text-xs text-gray-600 font-rajdhani">
-                      Waiting for confirmation...
-                    </p>
-
-                    {/* Amount reminder */}
-                    <div className="mt-4 pt-4 border-t border-white/5">
-                      <span className="text-gray-500 text-sm font-rajdhani">Amount: </span>
-                      <span className="text-lg font-bold font-orbitron text-[#ffd700]">
-                        {pendingBetItems.reduce((sum, item) => sum + item.amount, 0)}
-                      </span>
-                      <span className="text-sm text-gray-400 font-rajdhani ml-1">{config.tokenSymbol}</span>
+                <div className="text-center py-4">
+                  <div className="w-16 h-16 mx-auto mb-4 relative">
+                    <div
+                      className="absolute inset-0 rounded-full border-4 border-transparent animate-spin"
+                      style={{ borderTopColor: '#00ff88', borderRightColor: '#00ff8866', animationDuration: '1s' }}
+                    />
+                    <div className="absolute inset-2 rounded-full flex items-center justify-center">
+                      <div className="w-6 h-6 rounded-full bg-[#00ff88] animate-pulse" />
                     </div>
                   </div>
-                </>
+                  <h2 className="text-base font-bold text-[#00ff88] font-orbitron tracking-widest mb-2">
+                    AWAITING PAYMENT
+                  </h2>
+                  <p className="text-sm text-gray-400 mb-1">Check your wallet for the payment request</p>
+                  <p className="text-xs text-gray-600">Waiting for confirmation...</p>
+                  <div className="mt-4 pt-4 border-t border-white/5">
+                    <span className="text-gray-500 text-sm">Amount: </span>
+                    <span className="text-lg font-bold font-orbitron text-[#ffd700]">{totalBetAmount}</span>
+                    <span className="text-sm text-gray-400 ml-1">{config.tokenSymbol}</span>
+                  </div>
+                </div>
               ) : paymentStep === 'paid' ? (
-                <>
-                  {/* Payment Confirmed State */}
-                  <div className="text-center py-4">
-                    <div
-                      className="w-16 h-16 mx-auto mb-4 rounded-full flex items-center justify-center"
-                      style={{
-                        background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)',
-                        boxShadow: '0 0 40px #00ff8866'
-                      }}
-                    >
-                      <Check size={32} className="text-[#0a0a0f]" />
-                    </div>
-
-                    <h2 className="text-base font-bold text-[#00ff88] font-orbitron tracking-widest mb-2">
-                      BET CONFIRMED!
-                    </h2>
-                    <p className="text-sm text-gray-400 font-rajdhani">
-                      Your bet has been placed successfully
-                    </p>
-
-                    {/* Amount */}
-                    <div className="mt-4 pt-4 border-t border-white/5">
-                      <span className="text-gray-500 text-sm font-rajdhani">Bet Amount: </span>
-                      <span className="text-lg font-bold font-orbitron text-[#00ff88]">
-                        {pendingBetItems.reduce((sum, item) => sum + item.amount, 0)}
-                      </span>
-                      <span className="text-sm text-gray-400 font-rajdhani ml-1">{config.tokenSymbol}</span>
-                    </div>
+                <div className="text-center py-4">
+                  <div
+                    className="w-16 h-16 mx-auto mb-4 rounded-full flex items-center justify-center"
+                    style={{ background: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)' }}
+                  >
+                    <Check size={32} className="text-[#0a0a0f]" />
                   </div>
-                </>
+                  <h2 className="text-base font-bold text-[#00ff88] font-orbitron tracking-widest mb-2">
+                    CALL PLACED!
+                  </h2>
+                  <p className="text-sm text-gray-400">Good luck — check back when the round closes</p>
+                </div>
               ) : (
-                <>
-                  {/* Payment Failed State */}
-                  <div className="text-center py-4">
-                    <div
-                      className="w-16 h-16 mx-auto mb-4 rounded-full flex items-center justify-center"
-                      style={{
-                        background: 'linear-gradient(135deg, #ff6b6b 0%, #cc4444 100%)',
-                        boxShadow: '0 0 40px #ff6b6b44'
-                      }}
-                    >
-                      <X size={32} className="text-white" />
-                    </div>
-
-                    <h2 className="text-base font-bold text-[#ff6b6b] font-orbitron tracking-widest mb-2">
-                      PAYMENT FAILED
-                    </h2>
-                    <p className="text-sm text-gray-400 font-rajdhani mb-4">
-                      {paymentError || 'An error occurred. Please try again.'}
-                    </p>
-
-                    {/* Close button */}
-                    <button
-                      onClick={handleCancelBet}
-                      className="px-8 py-3 bg-transparent border-2 border-[#333] rounded-xl text-gray-400 text-sm font-orbitron font-semibold tracking-widest hover:border-[#444] hover:text-gray-300 transition-all"
-                    >
-                      CLOSE
-                    </button>
+                <div className="text-center py-4">
+                  <div
+                    className="w-16 h-16 mx-auto mb-4 rounded-full flex items-center justify-center"
+                    style={{ background: 'linear-gradient(135deg, #ff6b6b 0%, #cc4444 100%)' }}
+                  >
+                    <X size={32} className="text-white" />
                   </div>
-                </>
+                  <h2 className="text-base font-bold text-[#ff6b6b] font-orbitron tracking-widest mb-2">
+                    PAYMENT FAILED
+                  </h2>
+                  <p className="text-sm text-gray-400 mb-4">{paymentError}</p>
+                  <button
+                    onClick={closePaymentModal}
+                    className="w-full py-3 rounded-xl font-orbitron font-bold text-gray-300 border border-white/10"
+                  >
+                    CLOSE
+                  </button>
+                </div>
               )}
             </div>
           </div>

@@ -26,7 +26,7 @@ export interface Invoice {
 }
 
 export interface BetDetail {
-  digit: number;
+  direction: 'up' | 'down';
   amount: number;
 }
 
@@ -78,6 +78,22 @@ export class SphereService {
 
   async initialize(): Promise<void> {
     if (this.connected) return;
+    try {
+      await this.doInitialize();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('Sphere not initialized')) {
+        console.warn('[SphereService] Detected known SDK restore bug, self-healing...');
+        const fs = await import('fs/promises');
+        await fs.rm(this.config.dataDir, { recursive: true, force: true }).catch(() => {});
+        await this.doInitialize();
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  private async doInitialize(): Promise<void> {
 
     const network = this.config.network || 'testnet';
     // eslint-disable-next-line no-console
@@ -397,7 +413,7 @@ export class SphereService {
     }
 
     // Format bet details for message
-    const betsStr = bets.map((b) => `#${b.digit}:${b.amount}`).join(', ');
+    const betsStr = bets.map((b) => `${b.direction}:${b.amount}`).join(', ');
     const amountWithDecimals = toSmallestUnit(amount.toString()).toString();
 
     // Send payment request via SDK
@@ -407,7 +423,7 @@ export class SphereService {
         amount: amountWithDecimals,
         coinId: this.config.coinId,
         recipientNametag,
-        message: `Lottery Round #${roundNumber} - Bets: ${betsStr}`,
+        message: `M3 PriceCall Round #${roundNumber} - Calls: ${betsStr}`,
       }
     );
 

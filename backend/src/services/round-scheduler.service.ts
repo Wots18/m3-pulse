@@ -92,7 +92,7 @@ export class RoundScheduler {
       const drawnRound = await GameService.drawWinner(closedRound._id.toString());
 
       // eslint-disable-next-line no-console
-      console.log(`[RoundScheduler] Winning digit: ${drawnRound.winningDigit}`);
+      console.log(`[RoundScheduler] Winning direction: ${drawnRound.winningDirection}`);
 
       // Process payouts
       // eslint-disable-next-line no-console

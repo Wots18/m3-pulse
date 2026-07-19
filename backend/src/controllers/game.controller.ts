@@ -105,7 +105,7 @@ export class GameController {
         const betObj = bet.toObject();
         const round = betObj.roundId as {
           status?: string;
-          winningDigit?: number | null;
+          winningDirection?: 'up' | 'down' | 'flat' | null;
         } | null;
 
         // Determine win/loss result

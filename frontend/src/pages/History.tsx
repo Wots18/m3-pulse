@@ -2,10 +2,11 @@ import { Link } from 'react-router-dom';
 import { useRoundHistory } from '../api/hooks';
 import { config } from '../config';
 
-const DIGIT_COLORS = [
-  '#ff6b6b', '#ffd700', '#00ff88', '#4ecdc4', '#a855f7',
-  '#f472b6', '#fb923c', '#60a5fa', '#c084fc', '#34d399'
-] as const;
+const DIRECTION_COLOR: Record<string, string> = {
+  up: '#00ff88',
+  down: '#ff6b6b',
+  flat: '#94a3b8',
+};
 
 function formatDate(dateStr: string): string {
   const date = new Date(dateStr);
@@ -55,16 +56,17 @@ export function History() {
                       #{round.roundNumber}
                     </div>
 
-                    {/* Winning Digit */}
-                    {round.winningDigit !== null ? (
+                    {/* Winning Direction */}
+                    {round.winningDirection !== null ? (
                       <div
-                        className="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold text-lg font-orbitron"
+                        className="min-w-10 h-10 px-2 rounded-full flex items-center justify-center text-white font-bold text-sm font-orbitron gap-1"
                         style={{
-                          background: DIGIT_COLORS[round.winningDigit],
-                          boxShadow: `0 0 15px ${DIGIT_COLORS[round.winningDigit]}66`
+                          background: DIRECTION_COLOR[round.winningDirection],
+                          boxShadow: `0 0 15px ${DIRECTION_COLOR[round.winningDirection]}66`
                         }}
                       >
-                        {round.winningDigit}
+                        {round.winningDirection === 'up' ? '▲' : round.winningDirection === 'down' ? '▼' : '–'}
+                        {round.winningDirection.toUpperCase()}
                       </div>
                     ) : (
                       <div className="w-10 h-10 rounded-full bg-gray-700 flex items-center justify-center text-gray-500 font-bold">
@@ -80,6 +82,13 @@ export function History() {
                     }`}>
                       {round.status.toUpperCase()}
                     </span>
+
+                    {/* Asset + Price move */}
+                    {round.startPrice !== null && round.endPrice !== null && (
+                      <div className="text-xs text-gray-500">
+                        {round.asset} ${round.startPrice.toLocaleString()} → ${round.endPrice.toLocaleString()}
+                      </div>
+                    )}
                   </div>
 
                   <div className="text-right">

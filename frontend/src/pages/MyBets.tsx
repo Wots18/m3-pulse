@@ -3,10 +3,10 @@ import { useUserBets } from '../api/hooks';
 import type { Bet, Round } from '../api/client';
 import { config } from '../config';
 
-const DIGIT_COLORS = [
-  '#ff6b6b', '#ffd700', '#00ff88', '#4ecdc4', '#a855f7',
-  '#f472b6', '#fb923c', '#60a5fa', '#c084fc', '#34d399'
-] as const;
+const DIRECTION_COLOR: Record<string, string> = {
+  up: '#00ff88',
+  down: '#ff6b6b',
+};
 
 function formatDate(dateStr: string): string {
   const date = new Date(dateStr);
@@ -45,12 +45,12 @@ export function MyBets() {
   const { data: bets, isLoading } = useUserBets(nametag, 100);
 
   // Helper to get round info from populated roundId
-  const getRoundInfo = (bet: Bet): { roundNumber: number; winningDigit: number | null } | null => {
+  const getRoundInfo = (bet: Bet): { roundNumber: number; winningDirection: 'up' | 'down' | 'flat' | null } | null => {
     if (typeof bet.roundId === 'object' && bet.roundId !== null) {
       const round = bet.roundId as Round;
-      return { roundNumber: round.roundNumber, winningDigit: round.winningDigit };
+      return { roundNumber: round.roundNumber, winningDirection: round.winningDirection };
     }
-    return bet.roundNumber ? { roundNumber: bet.roundNumber, winningDigit: null } : null;
+    return bet.roundNumber ? { roundNumber: bet.roundNumber, winningDirection: null } : null;
   };
 
   return (
@@ -153,31 +153,32 @@ export function MyBets() {
                     </div>
                   </div>
 
-                  {/* Bet Digits */}
+                  {/* Bet Directions */}
                   <div className="flex gap-2 flex-wrap">
                     {bet.bets.map((b, i) => {
-                      const isWinningDigit = roundInfo?.winningDigit === b.digit;
+                      const isWinningDirection = roundInfo?.winningDirection === b.direction;
+                      const color = DIRECTION_COLOR[b.direction];
                       return (
                         <div
                           key={i}
                           className={`flex items-center gap-2 px-3 py-1.5 rounded-full ${
-                            isWinningDigit ? 'ring-2 ring-green-400' : ''
+                            isWinningDirection ? 'ring-2 ring-green-400' : ''
                           }`}
                           style={{
-                            background: `${DIGIT_COLORS[b.digit]}22`,
-                            border: `1px solid ${DIGIT_COLORS[b.digit]}66`
+                            background: `${color}22`,
+                            border: `1px solid ${color}66`
                           }}
                         >
                           <span
                             className="w-6 h-6 rounded-full flex items-center justify-center text-white font-bold text-xs"
-                            style={{ background: DIGIT_COLORS[b.digit] }}
+                            style={{ background: color }}
                           >
-                            {b.digit}
+                            {b.direction === 'up' ? '▲' : '▼'}
                           </span>
-                          <span className="text-sm font-medium" style={{ color: DIGIT_COLORS[b.digit] }}>
+                          <span className="text-sm font-medium" style={{ color }}>
                             {b.amount} {config.tokenSymbol}
                           </span>
-                          {isWinningDigit && (
+                          {isWinningDirection && (
                             <span className="text-green-400 text-xs font-bold">WIN</span>
                           )}
                         </div>

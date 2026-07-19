@@ -2,11 +2,11 @@ import mongoose, { Document, Schema } from 'mongoose';
 
 // Single bet within a round
 export interface IBetItem {
-  digit: number;
+  direction: 'up' | 'down';
   amount: number;
 }
 
-// Bet document - one per user per round (can contain multiple digit bets)
+// Bet document - one per user per round (can contain multiple direction bets)
 export interface IBet extends Document {
   roundId: mongoose.Types.ObjectId;
   roundNumber: number;
@@ -27,11 +27,10 @@ export interface IBet extends Document {
 
 const betItemSchema = new Schema<IBetItem>(
   {
-    digit: {
-      type: Number,
+    direction: {
+      type: String,
       required: true,
-      min: 0,
-      max: 9,
+      enum: ['up', 'down'],
     },
     amount: {
       type: Number,
@@ -117,8 +116,11 @@ betSchema.index({ roundId: 1, userNametag: 1 });
 // Round document
 export interface IRound extends Document {
   roundNumber: number;
+  asset: string;
   status: 'open' | 'closed' | 'drawing' | 'paying' | 'completed';
-  winningDigit: number | null;
+  startPrice: number | null;
+  endPrice: number | null;
+  winningDirection: 'up' | 'down' | 'flat' | null;
   totalPool: number;
   totalPayout: number;
   houseFee: number;
@@ -136,15 +138,27 @@ const roundSchema = new Schema<IRound>(
       required: true,
       unique: true,
     },
+    asset: {
+      type: String,
+      required: true,
+      default: 'BTC',
+    },
     status: {
       type: String,
       enum: ['open', 'closed', 'drawing', 'paying', 'completed'],
       default: 'open',
     },
-    winningDigit: {
+    startPrice: {
       type: Number,
-      min: 0,
-      max: 9,
+      default: null,
+    },
+    endPrice: {
+      type: Number,
+      default: null,
+    },
+    winningDirection: {
+      type: String,
+      enum: ['up', 'down', 'flat'],
       default: null,
     },
     totalPool: {

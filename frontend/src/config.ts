@@ -6,8 +6,8 @@ export const config = {
   apiUrl: import.meta.env.VITE_API_URL || '/api',
 
   // App Info
-  appName: import.meta.env.VITE_APP_NAME || 'SINGLE DIGIT',
-  appSubtitle: import.meta.env.VITE_APP_SUBTITLE || 'LOTTERY',
+  appName: import.meta.env.VITE_APP_NAME || 'M3 PRICECALL',
+  appSubtitle: import.meta.env.VITE_APP_SUBTITLE || 'PRICE PREDICTION',
 
   // Token
   tokenSymbol: import.meta.env.VITE_TOKEN_SYMBOL || 'UCT',

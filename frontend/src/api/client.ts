@@ -12,8 +12,11 @@ export const api = axios.create({
 export interface Round {
   _id: string;
   roundNumber: number;
+  asset: string;
   status: 'open' | 'closed' | 'drawing' | 'paying' | 'completed';
-  winningDigit: number | null;
+  startPrice: number | null;
+  endPrice: number | null;
+  winningDirection: 'up' | 'down' | 'flat' | null;
   totalPool: number;
   totalPayout: number;
   houseFee: number;
@@ -26,7 +29,7 @@ export interface Round {
 }
 
 export interface BetItem {
-  digit: number;
+  direction: 'up' | 'down';
   amount: number;
 }
 

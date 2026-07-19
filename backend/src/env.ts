@@ -25,7 +25,10 @@ export const config = {
   paymentTimeoutSeconds: parseInt(process.env.PAYMENT_TIMEOUT_SECONDS || '120', 10),
 
   // Round
-  roundDurationSeconds: parseInt(process.env.ROUND_DURATION_SECONDS || '3600', 10),
+  roundDurationSeconds: parseInt(process.env.ROUND_DURATION_SECONDS || '300', 10),
+
+  // Price market
+  priceAsset: process.env.PRICE_ASSET || 'BTC',
 
   // House fee (percentage of winning pool retained by developers)
   houseFeePercent: parseFloat(process.env.HOUSE_FEE_PERCENT || '5'),
