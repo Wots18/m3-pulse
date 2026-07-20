@@ -278,6 +278,24 @@ export class SphereService {
     console.log('[SphereService] Transfer did not match any pending payment');
   }
 
+  // Fire-and-forget Sphere DM to a player. Never throws - notifications must
+  // not break the payment or payout flow.
+  async sendDirectMessage(toNametag: string, content: string): Promise<void> {
+    if (!this.sphere) return;
+    const clean = toNametag.replace('@', '').trim();
+    try {
+      await this.sphere.communications.sendDM(`@${clean}`, content);
+      // eslint-disable-next-line no-console
+      console.log(`[SphereService] DM sent to @${clean}`);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[SphereService] DM to @${clean} failed (non-fatal):`,
+        err instanceof Error ? err.message : String(err)
+      );
+    }
+  }
+
   async resolvePubkey(nametag: string): Promise<string | null> {
     if (!this.sphere) {
       throw new Error('Sphere not initialized');

@@ -48,8 +48,22 @@ export class GameService {
   static async createRound(): Promise<IRound> {
     const lastRound = await Round.findOne().sort({ roundNumber: -1 });
     const roundNumber = lastRound ? lastRound.roundNumber + 1 : 1;
-    const asset = config.priceAsset;
-    const startPrice = await PriceService.getPrice(asset);
+    // Rotate the featured asset each round so all supported markets get playtime.
+    // Falls back to PRICE_ASSET if the rotated asset's price fetch fails.
+    const rotation = config.priceAssets.length > 0 ? config.priceAssets : [config.priceAsset];
+    let asset = rotation[(roundNumber - 1) % rotation.length];
+    let startPrice: number;
+    try {
+      startPrice = await PriceService.getPrice(asset);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[GameService] Price fetch failed for ${asset}, falling back to ${config.priceAsset}:`,
+        err instanceof Error ? err.message : String(err)
+      );
+      asset = config.priceAsset;
+      startPrice = await PriceService.getPrice(asset);
+    }
 
     try {
       const round = new Round({
@@ -239,6 +253,15 @@ export class GameService {
     bet.paymentTxId = txId;
     await bet.save();
 
+    // Notify the player their call is locked in (fire-and-forget)
+    const betSummary = bet.bets
+      .map((b) => `${b.amount} UCT ${b.direction.toUpperCase()}`)
+      .join(' + ');
+    void sphereService.sendDirectMessage(
+      bet.userNametag,
+      `\u2705 M3 PriceCall | Round #${round.roundNumber}: ${betSummary} on ${round.asset} is locked in. Result at round close!`
+    );
+
     // Log incoming payment
     await this.logPayment({
       type: 'incoming',
@@ -407,6 +430,14 @@ export class GameService {
 
       // eslint-disable-next-line no-console
       console.log(`[GameService] No winners - ${houseFee} UCT added to commission`);
+
+      // Notify all players their calls didn't hit (fire-and-forget)
+      for (const bet of bets) {
+        void sphereService.sendDirectMessage(
+          bet.userNametag,
+          `\ud83d\udcc9 M3 PriceCall | Round #${round.roundNumber}: ${round.asset} closed ${String(round.winningDirection).toUpperCase()} \u2014 no winning calls this round. Next round is already live!`
+        );
+      }
       return;
     }
 
@@ -448,6 +479,12 @@ export class GameService {
         // eslint-disable-next-line no-console
         console.log(
           `[GameService] @${bet.userNametag} bet ${userWinningBet} on ${round.winningDirection}, wins ${winnings} UCT`
+        );
+      } else {
+        // Losing call - notify (fire-and-forget)
+        void sphereService.sendDirectMessage(
+          bet.userNametag,
+          `\ud83d\udcc9 M3 PriceCall | Round #${round.roundNumber}: ${round.asset} closed ${String(round.winningDirection).toUpperCase()} \u2014 your call didn't hit this time. Next round is already live!`
         );
       }
     }
@@ -525,6 +562,12 @@ export class GameService {
             sentAmounts: transfer.sentAmounts,
           },
         });
+
+        // Notify the winner (fire-and-forget)
+        void sphereService.sendDirectMessage(
+          bet.userNametag,
+          `\ud83c\udf89 M3 PriceCall | Round #${bet.roundNumber}: ${round.asset} went ${String(round.winningDirection).toUpperCase()} \u2014 you WON ${bet.winnings} UCT! Payout sent to your wallet.`
+        );
 
         processed++;
       } catch (error) {

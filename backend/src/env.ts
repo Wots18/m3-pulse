@@ -31,6 +31,13 @@ export const config = {
 
   // Price market
   priceAsset: process.env.PRICE_ASSET || 'BTC',
+  priceAssets: (
+    process.env.PRICE_ASSETS ||
+    'BTC,ETH,SOL,XRP,BNB,DOGE,TON,ADA,LINK,AVAX,DOT,LTC,ATOM,UNI,NEAR,TRX,BCH,SHIB,MATIC,ICP,OKB'
+  )
+    .split(',')
+    .map((a) => a.trim().toUpperCase())
+    .filter(Boolean),
 
   // House fee (percentage of winning pool retained by developers)
   houseFeePercent: parseFloat(process.env.HOUSE_FEE_PERCENT || '5'),
