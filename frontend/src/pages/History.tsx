@@ -49,8 +49,8 @@ export function History() {
                 key={round._id}
                 className="bg-white/5 border border-white/10 rounded-xl p-4 hover:bg-white/10 transition-colors"
               >
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex flex-wrap items-center gap-2 sm:gap-4">
                     {/* Round Number */}
                     <div className="text-gray-500 text-sm font-medium">
                       #{round.roundNumber}
@@ -91,9 +91,9 @@ export function History() {
                     )}
                   </div>
 
-                  <div className="text-right">
+                  <div className="text-left sm:text-right">
                     {/* Pool & Payout */}
-                    <div className="flex items-center gap-4 text-sm">
+                    <div className="flex flex-wrap items-center gap-3 text-sm sm:gap-4">
                       <div>
                         <span className="text-gray-500">Pool:</span>{' '}
                         <span className="text-[#ffd700] font-semibold">{round.totalPool} {config.tokenSymbol}</span>
